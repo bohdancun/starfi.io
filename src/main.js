@@ -4,7 +4,7 @@ const ctx = canvas.getContext("2d");
 const shipImg = new Image();
 let shipImgReady = false;
 shipImg.onload = () => { shipImgReady = true; };
-shipImg.src = '/textures/ships/basic_ship/basicship.svg';
+shipImg.src = '/textures/ships/basic_ship/shipbasic1.svg';
 
 const shipOffscreen = document.createElement('canvas');
 const shipOffCtx = shipOffscreen.getContext('2d');
@@ -17,7 +17,22 @@ minimapFrameImg.src = '/textures/minimapframe.svg';
 const bulletImg = new Image();
 let bulletImgReady = false;
 bulletImg.onload = () => { bulletImgReady = true; };
-bulletImg.src = '/textures/ships/basic_ship/basicship_bullet.svg';
+bulletImg.src = '/textures/ships/basic_ship/shipbasic1bullet.svg';
+
+const prototwinkImg = new Image();
+let prototwinkImgReady = false;
+prototwinkImg.onload = () => { prototwinkImgReady = true; };
+prototwinkImg.src = '/textures/ships/prototwink/prototwink.svg';
+
+const prototwinkShortBulletImg = new Image();
+let prototwinkShortBulletImgReady = false;
+prototwinkShortBulletImg.onload = () => { prototwinkShortBulletImgReady = true; };
+prototwinkShortBulletImg.src = '/textures/ships/prototwink/prototwinkshortbullet.svg';
+
+const prototwinkLongBulletImg = new Image();
+let prototwinkLongBulletImgReady = false;
+prototwinkLongBulletImg.onload = () => { prototwinkLongBulletImgReady = true; };
+prototwinkLongBulletImg.src = '/textures/ships/prototwink/prototwinklongbullet.svg';
 
 const coinImgs = { small: new Image(), medium: new Image(), big: new Image() };
 const COIN_SIZES = { small: 12, medium: 18, big: 26 };
@@ -52,16 +67,22 @@ function loadRockTexture(path) {
   return img;
 }
 
-// Per-rock cosmetic state — only stores random rotation angle (server owns size/variant)
+// Per-rock cosmetic state — angle now server-owned and synced (no more random per client)
 const rockAppearance = new Map(); // id -> { angle }
 
 function syncRockAppearance(rocks) {
   const seen = new Set();
   for (const rock of rocks) {
     seen.add(rock.id);
-    if (!rockAppearance.has(rock.id)) {
-      rockAppearance.set(rock.id, { angle: Math.random() * Math.PI * 2 });
-      if (rock.texturePath) loadRockTexture(rock.texturePath);
+    const cur = rockAppearance.get(rock.id);
+    if (!cur) {
+      rockAppearance.set(rock.id, { angle: rock.angle ?? 0 });
+      if (rock.texturePath) {
+        loadRockTexture(rock.texturePath);
+        getRockPoly(rock.texturePath); // kick off async poly fetch
+      }
+    } else if (rock.angle != null) {
+      cur.angle = rock.angle; // keep in sync with authoritative server angle
     }
   }
   for (const [id] of rockAppearance) {
@@ -162,9 +183,158 @@ const PLAYER_ACCEL = 900;
 const PLAYER_MAX_SPEED = 650;
 const FWD_DRAG = 0.8;
 const LAT_DRAG = 7.0;
-const TURN_SPEED = 3.0;
+const TURN_SPEED = 3.0; // rad/s — raise for snappier turning, lower for heavier feel (mirror in server.js)
+
+// Returns the shortest signed angle from `from` to `to` in [-π, π].
+function shortestAngleDelta(from, to) {
+  let diff = (to - from) % (Math.PI * 2);
+  if (diff > Math.PI)  diff -= Math.PI * 2;
+  if (diff < -Math.PI) diff += Math.PI * 2;
+  return diff;
+}
+
+// --- Polygon collision helpers (mirrors server.js exactly) ---
+function parseSvgPathD(d) {
+  const verts = [];
+  let cx = 0, cy = 0;
+  const re = /([MLHVZ])([^MLHVZ]*)/gi;
+  let m;
+  while ((m = re.exec(d)) !== null) {
+    const cmd = m[1].toUpperCase();
+    const args = m[2].trim().split(/[\s,]+/).filter(Boolean).map(Number);
+    if      (cmd === 'M') { cx = args[0]; cy = args[1]; verts.push([cx, cy]); }
+    else if (cmd === 'L') { cx = args[0]; cy = args[1]; verts.push([cx, cy]); }
+    else if (cmd === 'H') { cx = args[0];               verts.push([cx, cy]); }
+    else if (cmd === 'V') {               cy = args[0]; verts.push([cx, cy]); }
+    else if (cmd === 'Z') break;
+  }
+  return verts;
+}
+
+function convexHull(pts) {
+  if (pts.length <= 3) return pts.slice();
+  let l = 0;
+  for (let i = 1; i < pts.length; i++) if (pts[i][0] < pts[l][0]) l = i;
+  const hull = [];
+  let p = l;
+  do {
+    hull.push(pts[p]);
+    let q = (p + 1) % pts.length;
+    for (let r = 0; r < pts.length; r++) {
+      const cross = (pts[q][0] - pts[p][0]) * (pts[r][1] - pts[p][1])
+                  - (pts[q][1] - pts[p][1]) * (pts[r][0] - pts[p][0]);
+      if (cross < 0) q = r;
+    }
+    p = q;
+  } while (p !== l && hull.length <= pts.length);
+  return hull;
+}
+
+function buildNormalizedPoly(svgText, texW, texH) {
+  const dm = svgText.match(/\bd="([^"]+)"/);
+  if (!dm) return null;
+  const raw = parseSvgPathD(dm[1]);
+  if (raw.length < 3) return null;
+  const hull = convexHull(raw);
+  const cx = texW / 2, cy = texH / 2;
+  return hull.map(([x, y]) => [x - cx, y - cy]);
+}
+
+function worldPoly(normPoly, scale, rotAngle, px, py) {
+  const ca = Math.cos(rotAngle), sa = Math.sin(rotAngle);
+  return normPoly.map(([nx, ny]) => {
+    const sx = nx * scale, sy = ny * scale;
+    return [px + sx * ca - sy * sa, py + sx * sa + sy * ca];
+  });
+}
+
+function projPoly(poly, ax, ay) {
+  let lo = Infinity, hi = -Infinity;
+  for (const [x, y] of poly) { const p = x * ax + y * ay; if (p < lo) lo = p; if (p > hi) hi = p; }
+  return [lo, hi];
+}
+
+function satOverlapMTV(A, B) {
+  let minDepth = Infinity, minNx = 0, minNy = 0;
+  for (const poly of [A, B]) {
+    for (let i = 0; i < poly.length; i++) {
+      const [ax, ay] = poly[i], [bx, by] = poly[(i + 1) % poly.length];
+      let nx = -(by - ay), ny = bx - ax;
+      const len = Math.hypot(nx, ny);
+      if (len < 1e-10) continue;
+      nx /= len; ny /= len;
+      const [loA, hiA] = projPoly(A, nx, ny);
+      const [loB, hiB] = projPoly(B, nx, ny);
+      if (hiA < loB - 1e-10 || hiB < loA - 1e-10) return null;
+      const depth = Math.min(hiA - loB, hiB - loA);
+      if (depth < minDepth) { minDepth = depth; minNx = nx; minNy = ny; }
+    }
+  }
+  return { nx: minNx, ny: minNy, depth: minDepth };
+}
+
+function satOverlap(A, B) { return satOverlapMTV(A, B) !== null; }
+
+function ptInPoly(x, y, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [xi, yi] = poly[i], [xj, yj] = poly[j];
+    if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+// Async fetch + parse SVG polygon for a given texture path (rocks — lazy per-path).
+const rockPolyCache = new Map(); // texturePath → normalized poly (or null)
+async function getRockPoly(texturePath) {
+  if (rockPolyCache.has(texturePath)) return rockPolyCache.get(texturePath);
+  try {
+    const resp = await fetch(texturePath);
+    const svg = await resp.text();
+    // Size comes from the folder: /textures/rocks/<size>/<file>.svg (mirrors server loader).
+    const fm = texturePath.match(/\/rocks\/(\d+)\//);
+    const size = fm ? parseInt(fm[1]) : 128;
+    const poly = buildNormalizedPoly(svg, size, size);
+    rockPolyCache.set(texturePath, poly);
+    return poly;
+  } catch { rockPolyCache.set(texturePath, null); return null; }
+}
+
+// Ship polys (fetched once at startup, keyed by shipType).
+const shipPolyCache = new Map(); // shipType → { poly, texW }
+async function loadShipPolyClient(shipType, svgPath) {
+  if (shipPolyCache.has(shipType)) return;
+  try {
+    const resp = await fetch(svgPath);
+    const svg = await resp.text();
+    const wm = svg.match(/width="(\d+)"/);
+    const texW = wm ? parseInt(wm[1]) : 128;
+    const poly = buildNormalizedPoly(svg, texW, texW);
+    shipPolyCache.set(shipType, { poly, texW });
+  } catch { shipPolyCache.set(shipType, null); }
+}
+// Prefetch ship polygons in background.
+loadShipPolyClient('basic',      '/textures/ships/basic_ship/shipbasic1.svg');
+loadShipPolyClient('prototwink', '/textures/ships/prototwink/prototwink.svg');
+
 const FIRE_COOLDOWN = 0.25;
 const MINIMAP_SIZE = 144;
+
+// --- Ship/bullet type mirrors (must match server) ---
+// Bullet types used by muzzle-based ships (prototwink).
+const BULLET_TYPES_CLIENT = {
+  short: { speed: 600, damage: 18 },
+  long:  { speed: 850, damage: 35 },
+};
+// Muzzle layouts for ships that use the muzzles[] system.
+const SHIP_MUZZLES_CLIENT = {
+  prototwink: [
+    { x: -12, y: 0, bulletType: 'short' },
+    { x:  12, y: 0, bulletType: 'short' },
+    { x: -52, y: 0, bulletType: 'long'  },
+    { x:  52, y: 0, bulletType: 'long'  },
+  ],
+};
 const MINIMAP_HALF_WORLD = 1000;
 const CORNER_PAD = 32;
 
@@ -285,6 +455,7 @@ const localPlayer = {
 
 let deathPoint = null;
 let prevDead = false;
+let shipChoiceOptions = null; // non-null while the ship-choice overlay is pending
 
 // Server-authoritative state
 const remotePlayers = new Map();
@@ -403,6 +574,10 @@ function handleMessage(event) {
     }
   }
 
+  else if (msg.type === 'shipChoice') {
+    shipChoiceOptions = msg.options;
+  }
+
   else if (msg.type === 'pong') {
     ping = Math.round(performance.now() - pingT);
   }
@@ -426,7 +601,7 @@ function sendInput() {
 
   ws.send(JSON.stringify({
     type: 'input',
-    angle: localPlayer.angle,
+    angle: aimAngle,
     thrust: currentThrust,
     shoot: pendingShoot,
   }));
@@ -436,39 +611,70 @@ function sendInput() {
 
 // --- Client-side collision prediction (mirrors server checkPlayerRockCollisions, no damage) ---
 
+let _prevContactNormalsClient = new Map(); // rock.id → { nx, ny }
+let _curContactNormalsClient  = new Map();
+
 function checkLocalPlayerRockCollisions() {
+  _curContactNormalsClient = new Map();
+
   for (const rock of serverRocks) {
     const cdx = torusDelta(localPlayer.x, rock.x, WORLD_W);
     const cdy = torusDelta(localPlayer.y, rock.y, WORLD_H);
     const dist = Math.hypot(cdx, cdy);
     const minDist = PLAYER_R + rock.r;
 
-    if (dist < minDist && dist > 0) {
-      const overlap = minDist - dist;
-      const nx = cdx / dist;
-      const ny = cdy / dist;
+    if (dist >= minDist || dist <= 0) continue;
 
-      const mP = PLAYER_R * PLAYER_R;
-      const mR = rock.r * rock.r;
-      const invSum = 1 / (mP + mR);
+    // Narrow phase: derive contact normal + penetration depth from polygon MTv.
+    const shipType     = localPlayer.shipType || 'basic';
+    const shipEntry    = shipPolyCache.get(shipType) ?? shipPolyCache.get('basic');
+    const rockNormPoly = rockPolyCache.get(rock.texturePath);
+    const rockAngle    = (rockAppearance.get(rock.id)?.angle) ?? 0;
 
-      localPlayer.x = ((localPlayer.x + nx * overlap * (mR * invSum)) % WORLD_W + WORLD_W) % WORLD_W;
-      localPlayer.y = ((localPlayer.y + ny * overlap * (mR * invSum)) % WORLD_H + WORLD_H) % WORLD_H;
+    let nx, ny, overlap;
+    if (shipEntry?.poly && rockNormPoly) {
+      const shipScale = (PLAYER_R * 2) / shipEntry.texW;
+      const shipP = worldPoly(shipEntry.poly, shipScale, localPlayer.angle + Math.PI / 2, cdx, cdy);
+      const rockP = worldPoly(rockNormPoly,   1.0,       rockAngle,                       0,   0);
+      const mtv = satOverlapMTV(shipP, rockP);
+      if (!mtv) continue;
 
-      const rvx = localPlayer.vx - (rock.vx || 0);
-      const rvy = localPlayer.vy - (rock.vy || 0);
-      const relN = rvx * nx + rvy * ny;
+      if (mtv.nx * cdx + mtv.ny * cdy < 0) { mtv.nx = -mtv.nx; mtv.ny = -mtv.ny; }
 
-      if (relN < 0) {
-        const j = -(1 + 0.15) * relN / (1 / mP + 1 / mR);
-        localPlayer.vx += (j / mP) * nx;
-        localPlayer.vy += (j / mP) * ny;
-        const punchMult = 1 + (localPlayer.upgrades.collisionShield || 0) * 0.20;
-        rock.vx = (rock.vx || 0) - (j * punchMult * 3.0 / mR) * nx;
-        rock.vy = (rock.vy || 0) - (j * punchMult * 3.0 / mR) * ny;
+      // Stabilize normal (mirrors server logic).
+      const prev = _prevContactNormalsClient.get(rock.id);
+      if (prev && prev.nx * mtv.nx + prev.ny * mtv.ny > 0.9) {
+        mtv.nx = prev.nx; mtv.ny = prev.ny;
       }
+      _curContactNormalsClient.set(rock.id, { nx: mtv.nx, ny: mtv.ny });
+
+      nx = mtv.nx; ny = mtv.ny; overlap = mtv.depth;
+    } else {
+      nx = cdx / dist; ny = cdy / dist; overlap = minDist - dist;
+    }
+
+    const mP = PLAYER_R * PLAYER_R;
+    const mR = rock.r * rock.r;
+    const invSum = 1 / (mP + mR);
+
+    localPlayer.x = ((localPlayer.x + nx * overlap * (mR * invSum)) % WORLD_W + WORLD_W) % WORLD_W;
+    localPlayer.y = ((localPlayer.y + ny * overlap * (mR * invSum)) % WORLD_H + WORLD_H) % WORLD_H;
+
+    const rvx = localPlayer.vx - (rock.vx || 0);
+    const rvy = localPlayer.vy - (rock.vy || 0);
+    const relN = rvx * nx + rvy * ny;
+
+    if (relN < 0) {
+      const j = -(1 + 0.15) * relN / (1 / mP + 1 / mR);
+      localPlayer.vx += (j / mP) * nx;
+      localPlayer.vy += (j / mP) * ny;
+      const punchMult = 1 + (localPlayer.upgrades.collisionShield || 0) * 0.20;
+      rock.vx = (rock.vx || 0) - (j * punchMult * 3.0 / mR) * nx;
+      rock.vy = (rock.vy || 0) - (j * punchMult * 3.0 / mR) * ny;
     }
   }
+
+  _prevContactNormalsClient = _curContactNormalsClient;
 }
 
 // --- Client-side prediction ---
@@ -489,7 +695,14 @@ function update(dt) {
   if (rightMouseDown) {
     aimAngle = Math.atan2(mouseY - canvas.height / 2, mouseX - canvas.width / 2);
   }
-  localPlayer.angle = aimAngle;
+  // Turn toward target angle at turnSpeed rad/s — mirrors server updatePlayers logic exactly.
+  const maxTurn = ts * dt;
+  const angleDiff = shortestAngleDelta(localPlayer.angle, aimAngle);
+  if (Math.abs(angleDiff) <= maxTurn) {
+    localPlayer.angle = aimAngle;
+  } else {
+    localPlayer.angle += Math.sign(angleDiff) * maxTurn;
+  }
 
   // Thrust: W/up or right-mouse = forward, S/down = reverse
   currentThrust = 0;
@@ -676,28 +889,38 @@ function drawXpBar(centerX, topY, radius, totalXp) {
   ctx.fillText(`${level}`, x + w + 4, topY + h / 2);
 }
 
-function drawShip(sx, sy, angle, color, r) {
-  const size = r * 2; // diameter = hitbox
+function getShipAsset(shipType) {
+  if (shipType === 'prototwink') return { img: prototwinkImg, ready: prototwinkImgReady };
+  return { img: shipImg, ready: shipImgReady };
+}
 
-  if (shipImgReady) {
-    if (shipOffscreen.width !== size) {
-      shipOffscreen.width = size;
-      shipOffscreen.height = size;
+function drawShip(sx, sy, angle, color, r, shipType) {
+  const { img, ready } = getShipAsset(shipType);
+  // Maintain the sprite's aspect ratio; width is always r*2 to match hitbox.
+  const drawW = r * 2;
+  const drawH = img.naturalHeight && img.naturalWidth
+    ? drawW * img.naturalHeight / img.naturalWidth
+    : drawW;
+
+  if (ready) {
+    if (shipOffscreen.width !== drawW || shipOffscreen.height !== drawH) {
+      shipOffscreen.width  = drawW;
+      shipOffscreen.height = drawH;
     }
-    shipOffCtx.clearRect(0, 0, size, size);
+    shipOffCtx.clearRect(0, 0, drawW, drawH);
     shipOffCtx.globalCompositeOperation = 'source-over';
-    shipOffCtx.drawImage(shipImg, 0, 0, size, size);
+    shipOffCtx.drawImage(img, 0, 0, drawW, drawH);
     shipOffCtx.globalCompositeOperation = 'multiply';
     shipOffCtx.fillStyle = color;
-    shipOffCtx.fillRect(0, 0, size, size);
+    shipOffCtx.fillRect(0, 0, drawW, drawH);
     // Clip tint back to original alpha so transparent areas stay transparent
     shipOffCtx.globalCompositeOperation = 'destination-in';
-    shipOffCtx.drawImage(shipImg, 0, 0, size, size);
+    shipOffCtx.drawImage(img, 0, 0, drawW, drawH);
 
     ctx.save();
     ctx.translate(sx, sy);
     ctx.rotate(angle + Math.PI / 2);
-    ctx.drawImage(shipOffscreen, -size / 2, -size / 2);
+    ctx.drawImage(shipOffscreen, -drawW / 2, -drawH / 2);
     ctx.restore();
   } else {
     // Fallback triangle while image loads
@@ -727,23 +950,15 @@ function drawRocks(camX, camY) {
     const drawSize = rock.r * 2;
     const angle = rockAppearance.get(rock.id)?.angle ?? 0;
 
+    // Lazy-loaded on first sight; skip drawing until the image is ready.
     const img = rock.texturePath ? loadRockTexture(rock.texturePath) : null;
+    if (!img || !img._loaded) continue;
 
-    if (img && img._loaded) {
-      ctx.save();
-      ctx.translate(sx, sy);
-      ctx.rotate(angle);
-      ctx.drawImage(img, -drawSize / 2, -drawSize / 2, drawSize, drawSize);
-      ctx.restore();
-    } else {
-      ctx.beginPath();
-      ctx.arc(sx, sy, rock.r, 0, Math.PI * 2);
-      ctx.fillStyle = "rgba(160,160,160,0.2)";
-      ctx.fill();
-      ctx.strokeStyle = "rgba(200,200,200,0.4)";
-      ctx.lineWidth = 2;
-      ctx.stroke();
-    }
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(angle);
+    ctx.drawImage(img, -drawSize / 2, -drawSize / 2, drawSize, drawSize);
+    ctx.restore();
   }
 }
 
@@ -798,6 +1013,13 @@ function drawXpDrops(camX, camY) {
   }
 }
 
+function getBulletAsset(variant) {
+  const s = PLAYER_R * 2 / 128;
+  if (variant === 'short') return { img: prototwinkShortBulletImg, ready: prototwinkShortBulletImgReady, bw: 24 * s, bh: 32 * s };
+  if (variant === 'long')  return { img: prototwinkLongBulletImg,  ready: prototwinkLongBulletImgReady,  bw: 24 * s, bh: 56 * s };
+  return { img: bulletImg, ready: bulletImgReady, bw: 24 * s, bh: 32 * s };
+}
+
 function drawBullets(camX, camY) {
   for (const b of serverBullets) {
     const dx = torusDelta(b.x, camX, WORLD_W);
@@ -805,17 +1027,18 @@ function drawBullets(camX, camY) {
     const sx = canvas.width  / 2 + dx;
     const sy = canvas.height / 2 + dy;
 
-    if (bulletImgReady) {
+    const { img, ready, bw, bh } = getBulletAsset(b.variant);
+    if (ready) {
       const color = b.ownerId === myId
         ? localPlayer.color
         : (remotePlayers.get(b.ownerId)?.color ?? '#ffffff');
       ctx.save();
       ctx.translate(sx, sy);
       ctx.rotate((b.angle ?? 0) + Math.PI / 2);
-      ctx.drawImage(bulletImg, -4, -16, 8, 32);
+      ctx.drawImage(img, -bw / 2, -bh / 2, bw, bh);
       ctx.globalCompositeOperation = 'multiply';
       ctx.fillStyle = color;
-      ctx.fillRect(-4, -16, 8, 32);
+      ctx.fillRect(-bw / 2, -bh / 2, bw, bh);
       ctx.globalCompositeOperation = 'source-over';
       ctx.restore();
     } else {
@@ -849,7 +1072,7 @@ function drawRemotePlayers(camX, camY) {
     const margin = PLAYER_R + 60;
     if (sx < -margin || sx > canvas.width + margin || sy < -margin || sy > canvas.height + margin) continue;
 
-    drawShip(sx, sy, p.angle, p.color, PLAYER_R);
+    drawShip(sx, sy, p.angle, p.color, PLAYER_R, p.shipType);
     const hpTopY = sy - PLAYER_R - 12;
     drawNickname(sx, hpTopY, p.name || 'Player');
     drawHealthBar(sx, hpTopY, PLAYER_R, p.hp, p.maxHp);
@@ -1138,9 +1361,13 @@ function drawHUD() {
   ctx.fillStyle = "#4ade80";
   ctx.fillText(`XP: ${localPlayer.xpCount}`, pad, pad + 28);
 
+  const { level: localLevel } = getLevelInfo(localPlayer.totalXpEarned ?? 0);
+  ctx.fillStyle = "#60a5fa";
+  ctx.fillText(`Lv. ${localLevel}`, pad, pad + 56);
+
   ctx.font = "14px Ticketing";
   ctx.fillStyle = "rgba(255,255,255,0.6)";
-  ctx.fillText(`Players online: ${remotePlayers.size + 1}`, pad, pad + 56);
+  ctx.fillText(`Players online: ${remotePlayers.size + 1}`, pad, pad + 84);
 
   ctx.textAlign = "right";
   ctx.fillStyle = "rgba(255,255,255,0.85)";
@@ -1225,7 +1452,7 @@ function draw() {
 
   if (!localPlayer.dead) {
     const cx = canvas.width / 2, cy = canvas.height / 2;
-    drawShip(cx, cy, localPlayer.angle, localPlayer.color, PLAYER_R);
+    drawShip(cx, cy, localPlayer.angle, localPlayer.color, PLAYER_R, localPlayer.shipType);
     const hpTopY = cy - PLAYER_R - 12;
     drawNickname(cx, hpTopY, localPlayer.nickname || 'Player');
     drawHealthBar(cx, hpTopY, PLAYER_R, localPlayer.hp, localPlayer.maxHp);
@@ -1237,7 +1464,58 @@ function draw() {
   drawMinimap();
 
   if (localPlayer.dead) drawDeathScreen();
+  if (shipChoiceOptions) drawShipChoiceOverlay();
 }
+
+// --- Ship choice overlay ---
+// DEV TEST: triggered at level 5 (temporary low threshold).
+
+const SHIP_LABELS = { prototwink: 'Prototwink' };
+const SHIP_CHOICE_BTN_W = 200;
+const SHIP_CHOICE_BTN_H = 48;
+
+function shipChoiceBtnRect(i) {
+  return {
+    x: canvas.width  / 2 - SHIP_CHOICE_BTN_W / 2,
+    y: canvas.height / 2 - 10 + i * (SHIP_CHOICE_BTN_H + 12),
+    w: SHIP_CHOICE_BTN_W,
+    h: SHIP_CHOICE_BTN_H,
+  };
+}
+
+function drawShipChoiceOverlay() {
+  ctx.fillStyle = 'rgba(0,0,0,0.65)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.font = '22px Ticketing';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText('Choose Your Ship', canvas.width / 2, canvas.height / 2 - 56);
+
+  for (let i = 0; i < shipChoiceOptions.length; i++) {
+    const { x, y, w, h } = shipChoiceBtnRect(i);
+    ctx.fillStyle = '#1e293b';
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = '#60a5fa';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x, y, w, h);
+    ctx.font = '18px Ticketing';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(SHIP_LABELS[shipChoiceOptions[i]] ?? shipChoiceOptions[i], x + w / 2, y + h / 2);
+  }
+}
+
+canvas.addEventListener('click', e => {
+  if (!shipChoiceOptions) return;
+  for (let i = 0; i < shipChoiceOptions.length; i++) {
+    const { x, y, w, h } = shipChoiceBtnRect(i);
+    if (e.clientX >= x && e.clientX <= x + w && e.clientY >= y && e.clientY <= y + h) {
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'selectShip', shipId: shipChoiceOptions[i] }));
+      shipChoiceOptions = null;
+    }
+  }
+});
 
 let last = performance.now();
 let fpsFrames = 0, fpsTime = 0, fps = 0;
