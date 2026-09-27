@@ -1,0 +1,11 @@
+<svg width="112" height="112" viewBox="0 0 112 112" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g clip-path="url(#clip0_121_22)">
+<path d="M8 32L24 16L32 0H64L80 8.5L96 16L112 32V64L104 80L96 96L80 112H32L8 104L0 80V64L8 48V32Z" fill="white"/>
+<path d="M16 32L32 24V8H48V16H40V32L24 40V48L16 64L24 56L32 48L40 64L48 80V88H32H24L16 80V88L32 96H48H80V88H88L80 80L72 88V80L80 72H88L96 64V32L64 16H48V8H64L96 24L104 32V64L96 80V88L80 104H32L16 96L8 80V64L16 48V32Z" fill="black"/>
+</g>
+<defs>
+<clipPath id="clip0_121_22">
+<rect width="112" height="112" fill="white"/>
+</clipPath>
+</defs>
+</svg>
