@@ -1,4 +1,4 @@
-import { transformPoly, circleVsPolygon, segmentVsPolygon } from '../shared/geometry.js';
+import { transformPoly, circleVsPolygon, segmentVsPolygon, pointInPolygon } from '../shared/geometry.js';
 import { extractAccentColor } from '../shared/svgAccent.js';
 import { classById } from '../shared/classes.js';
 import { FireInput } from './fireInput.js';
@@ -10,7 +10,7 @@ import {
 import { BIOMES, getBiomeForChunk, biomeWeights, smoothBiomeWeights } from '../shared/biomes.js';
 
 const canvas = document.getElementById("game");
-const ctx = canvas.getContext("2d");
+let ctx = canvas.getContext("2d"); // swapped to fadeCtx while a fading HUD group draws (drawFaded)
 
 // Ship/bullet textures come from the server's 'init' (paths relative to /textures/), loaded lazily.
 const texImgCache = new Map(); // path → HTMLImageElement
@@ -20,6 +20,7 @@ function texImg(path) {
     img = new Image();
     img._loaded = false;
     img.onload = () => { img._loaded = true; };
+    img.onerror = () => { img._failed = true; };
     img.src = `/textures/${path}`;
     texImgCache.set(path, img);
   }
@@ -41,26 +42,30 @@ let minimapFrameReady = false;
 minimapFrameImg.onload = () => { minimapFrameReady = true; };
 minimapFrameImg.src = '/textures/minimapframe.svg';
 
-const coinImgs = { small: new Image(), medium: new Image(), big: new Image() };
-const COIN_SIZES = { small: 12, medium: 18, big: 26 };
-for (const [key, img] of Object.entries(coinImgs)) {
-  img._loaded = false;
-  img.onload = () => { img._loaded = true; };
-  img.src = `/textures/particles/gold/${key}coin.svg`;
-}
+// Gold/XP pickup textures from the server's 'init': kind ('gold' | 'xp') → denomination → [{ path, w, h }]
+// (paths relative to /textures/, native size = drawn size). Each pickup names its variant with `tex`.
+let pickupTextures = { gold: {}, xp: {} };
 
-function makeXpImg(src) {
+function makeImg(src) {
   const img = new Image();
   img._loaded = false;
   img.onload = () => { img._loaded = true; };
   img.src = src;
   return img;
 }
-const xpImgs = {
-  big:   [1, 2, 3].map(n => makeXpImg(`/textures/particles/xp/bigxp/bigxp${n}.svg`)),
-  small: [1, 2, 3].map(n => makeXpImg(`/textures/particles/xp/smallxp/smallxp${n}.svg`)),
-};
-const XP_SIZES = { big: 24, small: 16 };
+// A pickup texture at its native size, centered at (sx, sy), rotated by its spawn rotation.
+function drawPickupImage(t, sx, sy, rot) {
+  ctx.save();
+  ctx.translate(sx, sy);
+  ctx.rotate(rot);
+  ctx.drawImage(t.img, -t.w / 2, -t.h / 2, t.w, t.h);
+  ctx.restore();
+}
+
+function pickupTexture(kind, denom, tex) {
+  const t = pickupTextures[kind]?.[denom]?.[tex];
+  return t ? { img: texImg(t.path), w: t.w, h: t.h } : null;
+}
 
 const rockImgCache = new Map(); // texturePath → HTMLImageElement
 const rockSilhouetteCache = new Map(); // `${texturePath}:${tintColor}` → canvas with solid silhouette
@@ -100,12 +105,18 @@ function syncRockAppearance(rocks) {
 // --- Biome color tinting ---
 // Everything scales with the camera's biome weights (shared/biomes.js biomeWeights: a pure function
 // of position, 0 in the neutral zone, 1 deep inside), so nothing can build up over time.
-const BIOME_OBJECT_TINT_ALPHA = 0.3; // silhouette tint on ships, rocks, chips and shards at weight 1 (was 0.2)
+const BIOME_OBJECT_TINT_ALPHA = 0.15; // silhouette tint on ships, rocks, chips and shards at weight 1
 const BIOME_TINT_COLORS = {
   frost: '#72A0E6',
   ember: '#E43B3B',
 };
-const BACKGROUND_TINT_ALPHA = 0.25; // mist over the background (below world objects) at weight 1 (was 0.5)
+const BACKGROUND_TINT_ALPHA = 0.5; // mist over the background (below world objects) at weight 1
+// Brightness of the biome backgrounds (base color and mist), 1 = as defined; lower = darker.
+const BACKGROUND_BRIGHTNESS = 0.6;
+// Per-biome mist overrides (client-only); biomes not listed use BIOMES[id].biomeTint at BACKGROUND_TINT_ALPHA.
+const BIOME_MIST_OVERRIDES = {
+  ember: { rgb: [74, 0, 0], alpha: 0.5 }, // #4A0000 at 50%
+};
 
 // Camera biome weights, recomputed from position every frame and lightly smoothed.
 let biomeW = { frost: 0, ember: 0 };
@@ -155,28 +166,32 @@ function initStars() {
 }
 
 // --- Shooting stars ---
+// Wasteland only: spawning stops outside it, and every star fades with the wasteland weight (the same
+// smoothed biome weights as the tint). Parallax is measured from the camera position at spawn (torus-safe),
+// so a star never jumps while flying, even when the camera wraps around the world.
 const shootingStars = [];
-const SHOOTING_STAR_RATE = 0.15; // avg spawns per second
-const SHOOTING_STAR_PARALLAX = 0.04; // same depth as far star layer
+const SHOOTING_STAR_RATE = 0.15;      // avg spawns per second
+const SHOOTING_STAR_PARALLAX = 0.02;  // deeper than the far star layer (0.04)
+const SHOOTING_STAR_SIZE = 2;         // × base trail length [60, 150] and width 1.5
 
 function spawnShootingStar() {
-  const ox = ((localPlayer.x * SHOOTING_STAR_PARALLAX) % PARALLAX_TILE + PARALLAX_TILE) % PARALLAX_TILE;
-  const oy = ((localPlayer.y * SHOOTING_STAR_PARALLAX) % PARALLAX_TILE + PARALLAX_TILE) % PARALLAX_TILE;
   const angle = (Math.random() * 30 + 15) * Math.PI / 180; // 15–45° downward
   const speed = Math.random() * 400 + 350;
   shootingStars.push({
-    x: Math.random() * canvas.width * 1.2 - canvas.width * 0.1 + ox,
-    y: Math.random() * canvas.height * 0.5 + oy,
+    x: Math.random() * viewW * 1.2 - viewW * 0.1,
+    y: Math.random() * viewH * 0.5,
+    camX0: localPlayer.x,
+    camY0: localPlayer.y,
     vx: Math.cos(angle) * speed,
     vy: Math.sin(angle) * speed,
-    len: Math.random() * 90 + 60,
+    len: (Math.random() * 90 + 60) * SHOOTING_STAR_SIZE,
     alpha: Math.random() * 0.3 + 0.7,
     life: 1,
   });
 }
 
 function updateShootingStars(dt) {
-  if (Math.random() < SHOOTING_STAR_RATE * dt) spawnShootingStar();
+  if (wastelandDust.fade() > 0.01 && Math.random() < SHOOTING_STAR_RATE * dt) spawnShootingStar();
   for (let i = shootingStars.length - 1; i >= 0; i--) {
     const s = shootingStars[i];
     s.x += s.vx * dt;
@@ -187,32 +202,358 @@ function updateShootingStars(dt) {
 }
 
 function drawShootingStars(camX, camY) {
-  const ox = ((camX * SHOOTING_STAR_PARALLAX) % PARALLAX_TILE + PARALLAX_TILE) % PARALLAX_TILE;
-  const oy = ((camY * SHOOTING_STAR_PARALLAX) % PARALLAX_TILE + PARALLAX_TILE) % PARALLAX_TILE;
+  const biome = wastelandDust.fade();
+  if (!(biome > 0)) return;
   for (const s of shootingStars) {
-    const sx = s.x - ox;
-    const sy = s.y - oy;
+    const sx = s.x - torusDelta(camX, s.camX0, WORLD_W) * SHOOTING_STAR_PARALLAX;
+    const sy = s.y - torusDelta(camY, s.camY0, WORLD_H) * SHOOTING_STAR_PARALLAX;
     const nx = -s.vx / Math.hypot(s.vx, s.vy);
     const ny = -s.vy / Math.hypot(s.vx, s.vy);
     const tx = sx + nx * s.len;
     const ty = sy + ny * s.len;
     const grad = ctx.createLinearGradient(sx, sy, tx, ty);
-    const a = Math.min(1, s.alpha * s.life * 2).toFixed(2);
-    grad.addColorStop(0, `rgba(255,255,255,${a})`);
-    grad.addColorStop(0.3, `rgba(220,230,255,${Math.min(1, s.alpha * s.life * 1.4).toFixed(2)})`);
+    const a = Math.min(1, s.alpha * s.life * 2) * biome;
+    grad.addColorStop(0, `rgba(255,255,255,${a.toFixed(2)})`);
+    grad.addColorStop(0.3, `rgba(220,230,255,${(Math.min(1, s.alpha * s.life * 1.4) * biome).toFixed(2)})`);
     grad.addColorStop(1, `rgba(180,200,255,0)`);
     ctx.beginPath();
     ctx.moveTo(sx, sy);
     ctx.lineTo(tx, ty);
     ctx.strokeStyle = grad;
-    ctx.lineWidth = Math.max(0.5, s.life * 1.5);
+    ctx.lineWidth = Math.max(0.5, s.life * 1.5) * SHOOTING_STAR_SIZE;
     ctx.stroke();
   }
+}
+
+// --- Biome particles (wasteland dust, Ember Belt embers) ---
+// Background particles in two parallax layers per biome: above the starfield and biome mist, below every
+// world entity. Drawn as the texture files (or filled with the config's `color`, if set), at native size
+// in world units (so they follow the world zoom). Positions live in each particle's parallax space; on screen they wrap
+// within the view plus a margin. Each system fades with its biome's weight, derived from the same
+// smoothed biome weights (biomeW) as the biome tint, so particles and tint transition together.
+// `motion` picks the movement: 'swirl' (storm turbulence, uses the swirl/gust keys), 'straight'
+// (random direction at spawn, constant speed for the whole life) or 'wind' (drift along one wind
+// direction shared by the whole system, plus a gentle per-particle sway across it).
+const WASTELAND_DUST_CONFIG = {
+  motion: 'swirl',
+  textures: [ // every file in public/textures/particles/wasteland/ (Vite can't list folders at runtime)
+    'wasteland1.svg', 'wasteland2.svg', 'wasteland3.svg', 'wasteland4.svg',
+    'wasteland5.svg', 'wasteland6.svg', 'wasteland7.svg', 'wasteland8.svg',
+  ],
+  layers: {
+    deep: {
+      count: 12,
+      maxOpacity: 0.20,
+      sizeScale: 0.6,        // × native texture size
+      parallax: 0.35,        // screen motion relative to the camera (1 = moves with the world)
+      speed: [60, 130],      // base speed range, view units/s
+      turnRate: 3.5,         // max swirl angular rate, rad/s
+      turnChange: 2.5,       // how fast the swirl rate re-targets (1/s)
+    },
+    close: {
+      count: 4,
+      maxOpacity: 0.30,
+      sizeScale: 1,
+      parallax: 0.75,
+      speed: [110, 210],
+      turnRate: 5,
+      turnChange: 3.5,
+    },
+  },
+  spin: [0.75, 3.5],         // rad/s, random direction
+  life: [2.1, 4.8],          // s, total lifetime per spawn (longer = respawns less often)
+  fadeIn: 0.15,              // s
+  fadeOut: 0.25,             // s
+  swirlRetarget: [0.16, 0.6], // s between picks of a new swirl rate (chaotic turns)
+  speedJitter: 0.35,         // ± fraction the speed wanders around its base
+  // Per-particle character, rolled at each spawn, so no two particles move alike:
+  swirlScale: [0.15, 1.4],   // × layer turnRate: near-straight gusts … tight loops
+  curlBias: 0.6,             // up to ± this × turnRate of steady curl in one direction
+  retargetScale: [0.5, 2.2], // × swirlRetarget: twitchy vs. lazy direction changes
+  parallaxJitter: 0.3,       // ± fraction around the layer's parallax (no lockstep with the camera)
+  gustChance: 0.2,           // chance per swirl retarget of a sudden kick
+  gustKick: [0.6, 2.0],      // rad, heading jump on a gust (random side)
+  gustBoost: [1.4, 2.2],     // × speed at the start of a gust
+  gustDecay: 1.25,           // 1/s, how fast a gust's speed boost fades
+  spawnMargin: 60,           // view units around the screen where particles may spawn/wrap
+};
+
+const EMBER_PARTICLES_CONFIG = {
+  motion: 'straight',
+  color: '#971e1d',          // every texture's shape filled with this color (a layer's `color` overrides it)
+  textures: [ // every file in public/textures/particles/amber/
+    'amber1.svg', 'amber2.svg', 'amber3.svg', 'amber4.svg', 'amber5.svg',
+    'amber6.svg', 'amber7.svg', 'amber8.svg', 'amber9.svg',
+  ],
+  layers: {
+    deep: {
+      count: 12,
+      maxOpacity: 0.20,
+      sizeScale: 1.2,        // × native texture size
+      parallax: 0.35,        // screen motion relative to the camera (1 = moves with the world)
+      speed: [180, 390],     // constant speed per particle, view units/s
+    },
+    close: {
+      count: 4,
+      maxOpacity: 0.30,
+      sizeScale: 2,
+      color: '#e43b3b',      // overrides the system color for this layer
+      parallax: 0.75,
+      speed: [330, 630],
+    },
+  },
+  spin: [0.75, 3.5],         // rad/s, random direction
+  life: [0.4, 0.9],          // s, total lifetime per spawn
+  fadeIn: 0.1,               // s
+  fadeOut: 0.15,             // s
+  parallaxJitter: 0,         // ± fraction around the layer's parallax
+  spawnMargin: 60,           // view units around the screen where particles may spawn/wrap
+};
+
+const FROST_PARTICLES_CONFIG = {
+  motion: 'wind',
+  textures: [ // every file in public/textures/particles/cold/ (there is no cold11)
+    'cold1.svg', 'cold2.svg', 'cold3.svg', 'cold4.svg', 'cold5.svg', 'cold6.svg',
+    'cold7.svg', 'cold8.svg', 'cold9.svg', 'cold10.svg', 'cold12.svg', 'cold13.svg',
+  ],
+  layers: {
+    deep: {
+      count: 48,
+      maxOpacity: 0.20,
+      sizeScale: 0.6,        // × native texture size
+      parallax: 0.35,        // screen motion relative to the camera (1 = moves with the world)
+      speed: [25, 55],       // drift speed along the wind per particle, view units/s
+    },
+    close: {
+      count: 16,
+      maxOpacity: 0.30,
+      sizeScale: 1,
+      parallax: 0.75,
+      speed: [45, 90],
+    },
+  },
+  wind: {
+    changeEvery: [6, 12],    // s between picks of a new random target direction
+    ease: 0.25,              // 1/s, how fast the wind turns toward its target (smooth, no sudden turns)
+  },
+  swayAmplitude: [8, 30],    // view units, side-to-side sway across the wind
+  swayFrequency: [0.15, 0.5], // Hz
+  spin: [0.1, 0.4],          // rad/s, random direction (start rotation is random 0–360°)
+  life: [4, 8],              // s, total lifetime per spawn
+  fadeIn: 0.8,               // s
+  fadeOut: 1.0,              // s
+  parallaxJitter: 0,         // ± fraction around the layer's parallax
+  spawnMargin: 60,           // view units around the screen where particles may spawn/wrap
+};
+
+const randRange = (a, b) => a + Math.random() * (b - a);
+
+// One system per biome: its config, textures, fixed pool (created once, recycled) and fade (0..1).
+function makeBiomeParticles(config, folder, fade) {
+  const imgs = config.textures.map(f => texImg(`particles/${folder}/${f}`));
+  const pool = [];
+  for (const layer of Object.values(config.layers)) {
+    for (let i = 0; i < layer.count; i++) {
+      pool.push({ layer, x: 0, y: 0, heading: 0, baseSpeed: 0, speed: 0, turn: 0,
+        turnTarget: 0, retarget: 0, rot: 0, spin: 0, age: 0, life: 0, img: 0, spawned: false,
+        swirl: 0, bias: 0, retargetMul: 1, parallax: 0, boost: 1,
+        swayAmp: 0, swayFreq: 0, swayPhase: 0 });
+    }
+  }
+  // wind: shared direction for 'wind' motion (radians), eased toward `target`, re-picked when `timer` runs out.
+  const wind = { angle: Math.random() * Math.PI * 2, target: 0, timer: 0 };
+  wind.target = wind.angle;
+  return { config, imgs, pool, fade, colored: {}, wind }; // colored: color → [canvas per texture]
+}
+
+// Texture filled with a color (shape kept via its alpha), built once per texture and color after load.
+// Rasterized at PARTICLE_COLOR_RES × native so the scaled-up layers stay sharp.
+const PARTICLE_COLOR_RES = 4;
+function coloredParticleImg(sys, i, color) {
+  const cache = sys.colored[color] || (sys.colored[color] = []);
+  let c = cache[i];
+  if (c) return c;
+  const img = sys.imgs[i];
+  c = document.createElement('canvas');
+  c.width = Math.ceil(img.naturalWidth * PARTICLE_COLOR_RES);
+  c.height = Math.ceil(img.naturalHeight * PARTICLE_COLOR_RES);
+  const g = c.getContext('2d');
+  g.drawImage(img, 0, 0, c.width, c.height);
+  g.globalCompositeOperation = 'source-in';
+  g.fillStyle = color;
+  g.fillRect(0, 0, c.width, c.height);
+  cache[i] = c;
+  return c;
+}
+
+// Wasteland: 1 deep in it, 0 inside Frost/Ember (the complement of the tint weights; bands never overlap).
+const wastelandDust = makeBiomeParticles(WASTELAND_DUST_CONFIG, 'wasteland',
+  () => Math.max(0, Math.min(1, 1 - biomeW.frost - biomeW.ember)));
+// Ember Belt: the same smoothed ember weight the tint uses.
+const emberParticles = makeBiomeParticles(EMBER_PARTICLES_CONFIG, 'amber',
+  () => Math.max(0, Math.min(1, biomeW.ember)));
+// Frost Nebula: the same smoothed frost weight the tint uses.
+const frostParticles = makeBiomeParticles(FROST_PARTICLES_CONFIG, 'cold',
+  () => Math.max(0, Math.min(1, biomeW.frost)));
+
+function respawnParticle(sys, p, camX, camY) {
+  const C = sys.config, L = p.layer, m = C.spawnMargin;
+  p.parallax = L.parallax * (1 + (Math.random() * 2 - 1) * C.parallaxJitter);
+  p.x = camX * p.parallax + randRange(-m, viewW + m);
+  p.y = camY * p.parallax + randRange(-m, viewH + m);
+  p.heading = Math.random() * Math.PI * 2;
+  p.baseSpeed = randRange(L.speed[0], L.speed[1]);
+  p.speed = p.baseSpeed;
+  p.boost = 1;
+  if (C.motion === 'swirl') {
+    p.swirl = L.turnRate * randRange(C.swirlScale[0], C.swirlScale[1]);
+    p.bias = L.turnRate * C.curlBias * (Math.random() * 2 - 1);
+    p.retargetMul = randRange(C.retargetScale[0], C.retargetScale[1]);
+    p.turn = p.bias + (Math.random() * 2 - 1) * p.swirl;
+    p.turnTarget = p.turn;
+    p.retarget = randRange(C.swirlRetarget[0], C.swirlRetarget[1]) * p.retargetMul;
+  }
+  if (C.motion === 'wind') {
+    p.swayAmp = randRange(C.swayAmplitude[0], C.swayAmplitude[1]);
+    p.swayFreq = randRange(C.swayFrequency[0], C.swayFrequency[1]) * Math.PI * 2; // rad/s
+    p.swayPhase = Math.random() * Math.PI * 2;
+  }
+  p.rot = Math.random() * Math.PI * 2;
+  p.spin = randRange(C.spin[0], C.spin[1]) * (Math.random() < 0.5 ? -1 : 1);
+  p.life = randRange(C.life[0], C.life[1]);
+  p.age = 0;
+  p.img = Math.floor(Math.random() * sys.imgs.length);
+  p.spawned = true;
+}
+
+// Swirl motion: the heading turns at a rate that keeps re-targeting at random, plus occasional gusts.
+function swirlParticle(C, p, dt) {
+  p.retarget -= dt;
+  if (p.retarget <= 0) {
+    p.turnTarget = p.bias + (Math.random() * 2 - 1) * p.swirl;
+    p.retarget = randRange(C.swirlRetarget[0], C.swirlRetarget[1]) * p.retargetMul;
+    p.speed = p.baseSpeed * (1 + (Math.random() * 2 - 1) * C.speedJitter);
+    if (Math.random() < C.gustChance) { // sudden gust: sharp turn and a burst of speed
+      p.heading += randRange(C.gustKick[0], C.gustKick[1]) * (Math.random() < 0.5 ? -1 : 1);
+      p.boost = randRange(C.gustBoost[0], C.gustBoost[1]);
+    }
+  }
+  p.boost = 1 + (p.boost - 1) * Math.exp(-C.gustDecay * dt);
+  p.turn += (p.turnTarget - p.turn) * Math.min(1, p.layer.turnChange * dt);
+  p.heading += p.turn * dt;
+}
+
+// Wind: one direction per system, eased smoothly toward a random target re-picked every few seconds.
+function updateWind(sys, dt) {
+  const W = sys.config.wind, wind = sys.wind;
+  wind.timer -= dt;
+  if (wind.timer <= 0) {
+    wind.target = Math.random() * Math.PI * 2;
+    wind.timer = randRange(W.changeEvery[0], W.changeEvery[1]);
+  }
+  wind.angle += shortestAngleDelta(wind.angle, wind.target) * Math.min(1, W.ease * dt);
+}
+
+function updateBiomeParticles(sys, dt) {
+  const C = sys.config, swirl = C.motion === 'swirl', windy = C.motion === 'wind';
+  const camX = localPlayer.x, camY = localPlayer.y;
+  let wx = 0, wy = 0;
+  if (windy) { updateWind(sys, dt); wx = Math.cos(sys.wind.angle); wy = Math.sin(sys.wind.angle); }
+  for (const p of sys.pool) {
+    if (!p.spawned) { respawnParticle(sys, p, camX, camY); p.age = Math.random() * p.life; } // staggered start
+    p.age += dt;
+    if (p.age >= p.life) { respawnParticle(sys, p, camX, camY); continue; }
+    if (windy) {
+      // Drift along the wind, plus the sway's velocity across it (derivative of amp·sin(phase)).
+      p.swayPhase += p.swayFreq * dt;
+      const side = p.swayAmp * p.swayFreq * Math.cos(p.swayPhase);
+      p.x += (wx * p.speed - wy * side) * dt;
+      p.y += (wy * p.speed + wx * side) * dt;
+    } else {
+      if (swirl) swirlParticle(C, p, dt); // 'straight': heading and speed stay as spawned
+      p.x += Math.cos(p.heading) * p.speed * p.boost * dt;
+      p.y += Math.sin(p.heading) * p.speed * p.boost * dt;
+    }
+    p.rot += p.spin * dt;
+  }
+}
+
+// Drawn in view units (inside drawWorld's zoom).
+function drawBiomeParticles(sys, camX, camY) {
+  const biome = sys.fade();
+  if (!(biome > 0)) return;
+  const C = sys.config, m = C.spawnMargin;
+  const spanW = viewW + 2 * m, spanH = viewH + 2 * m;
+  for (const p of sys.pool) {
+    if (!p.spawned) continue;
+    const img = sys.imgs[p.img];
+    if (!img._loaded) continue;
+    const life = Math.min(1, p.age / C.fadeIn, (p.life - p.age) / C.fadeOut);
+    const alpha = p.layer.maxOpacity * Math.max(0, life) * biome;
+    if (!(alpha > 0)) continue;
+    const sx = ((p.x - camX * p.parallax + m) % spanW + spanW) % spanW - m;
+    const sy = ((p.y - camY * p.parallax + m) % spanH + spanH) % spanH - m;
+    const w = img.naturalWidth * p.layer.sizeScale, h = img.naturalHeight * p.layer.sizeScale;
+    const color = p.layer.color || C.color;
+    const src = color ? coloredParticleImg(sys, p.img, color) : img;
+    // World zoom × rotation about the particle's center, set directly (no save/restore, no allocations).
+    const z = viewZoom, cos = Math.cos(p.rot) * z, sin = Math.sin(p.rot) * z;
+    ctx.setTransform(cos, sin, -sin, cos, sx * z, sy * z);
+    ctx.globalAlpha = alpha;
+    ctx.drawImage(src, -w / 2, -h / 2, w, h);
+  }
+  ctx.setTransform(viewZoom, 0, 0, viewZoom, 0, 0);
+  ctx.globalAlpha = 1;
+}
+
+// --- World zoom ---
+// Every player of a class sees at least the same (REF_VIEW_W×REF_VIEW_H × the class's viewFactor) world
+// units, whatever the window: the zoom fits that area into the window, and extra width/height shows more
+// world. The server only sends entities within the class's sendRange (server.js SHIP_TYPES, a circle
+// around the player), so the view's half-diagonal is capped at MAX_VIEW_HALF_DIAG × viewFactor, leaving
+// room for the biggest rocks to slide in from beyond the edge rather than pop in:
+//   basic 0.736 → cap 1030 (send 1600), twink 0.8 → 1120 (1600), sniper 1.0 → 1400 (2000).
+// On very wide/tall windows the cap zooms in a bit past "fit". The factor eases over VIEW_EASE_TIME when
+// the class changes. World drawing works in view units (viewW × viewH), mapped by ctx.scale(viewZoom).
+const REF_VIEW_W = 1920;
+const REF_VIEW_H = 1080;
+const MAX_VIEW_HALF_DIAG = 1400; // at viewFactor 1
+const VIEW_EASE_TIME = 0.6;      // s
+let viewZoom = 1, viewW = REF_VIEW_W, viewH = REF_VIEW_H;
+const viewFactor = { value: 1, from: 1, to: 1, t: Infinity, init: false };
+
+// Zoom and view size from the window and the current (eased) view factor. Cheap; runs every frame.
+function computeView() {
+  const f = viewFactor.value;
+  let z = Math.min(canvas.width / (REF_VIEW_W * f), canvas.height / (REF_VIEW_H * f));
+  const halfDiag = Math.hypot(canvas.width, canvas.height) / (2 * z);
+  const cap = MAX_VIEW_HALF_DIAG * f;
+  if (halfDiag > cap) z *= halfDiag / cap;
+  viewZoom = z;
+  viewW = canvas.width / z;
+  viewH = canvas.height / z;
+}
+
+// Ease toward the local player's class view factor (snaps the first time a class is known).
+function updateViewFactor(dt) {
+  if (myId === null) return;
+  const target = shipType(localPlayer.shipType).viewFactor ?? 1;
+  const V = viewFactor;
+  if (!V.init) { V.value = V.from = V.to = target; V.t = Infinity; V.init = true; }
+  else if (target !== V.to) { V.from = V.value; V.to = target; V.t = 0; }
+  V.t += dt;
+  V.value = V.t >= VIEW_EASE_TIME ? V.to : V.from + (V.to - V.from) * easeInOutCubic(V.t / VIEW_EASE_TIME);
+  computeView();
+}
+function easeInOutCubic(t) {
+  t = Math.max(0, Math.min(1, t));
+  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 }
 
 function resize() {
   canvas.width = window.innerWidth;
   canvas.height = window.innerHeight;
+  computeView();
   initStars();
 }
 window.addEventListener("resize", resize);
@@ -220,11 +561,8 @@ resize();
 
 // Constants (must match server)
 // WORLD_W/WORLD_H, wrapX/wrapY and torusDelta come from shared/world.js (world centered on the origin).
-const PLAYER_ACCEL = 900;
-const PLAYER_MAX_SPEED = 650;
-const FWD_DRAG = 0.8;
-const LAT_DRAG = 7.0;
-const TURN_SPEED = 3.0; // rad/s — raise for snappier turning, lower for heavier feel (mirror in server.js)
+// Movement stats (maxSpeed, accel, fwdDrag, latDrag, turnSpeed) come from the server as localPlayer.move:
+// the class base × upgrades, sent in 'init' and whenever they change. No client copies.
 
 // Returns the shortest signed angle from `from` to `to` in [-π, π].
 function shortestAngleDelta(from, to) {
@@ -245,7 +583,23 @@ function rockMass(rock) {
   return rock.r * rock.r * (rockKinds[rock.k]?.massMult ?? 1);
 }
 
-// Rotated shape for a rock, cached on its appearance entry until its angle changes.
+// Shape textures (server SHAPE_TEXTURES, sent in 'init'): [{ path, w, h, polys }] for crystals and
+// explosion particles, referenced by index. Drawn as solid silhouettes in a color.
+let shapeTextures = [];
+// Crystal rocks (server CRYSTAL_CONFIG): a rock's `cr` lists its crystals as
+// [texture index, local x, local y, rotation step, color index] in rock-local (unrotated) coordinates.
+let crystalInfo = { colors: [], opacity: 0.8, rotationStepDeg: 45, drawOnTop: true, fadeStart: 0.7 };
+// Explosion rocks (server EXPLOSION_CONFIG): `ep` lists the particle slots in the same format; the
+// rock shows round(max × (1 − hp / maxHp)) of them, in order, each popping in over popInTime.
+let explosionInfo = { colors: [], opacity: 0.6, rotationStepDeg: 45, maxParticles: 15, popInTime: 0.15, fadeStart: 0.7,
+  blastRadius: 250, knockbackShip: 600, ringDuration: 0.2, ringColor: '#E43B3B', gridSnap: 8, fragmentFadeTime: 1.5 };
+const crystalRot = step => step * crystalInfo.rotationStepDeg * Math.PI / 180;
+// Per flying-particle kind: opacity and fade start.
+const shardKindInfo = k => (k === 'ember' ? explosionInfo : crystalInfo);
+
+// Rotated shape for a rock, cached on its appearance entry until its angle changes. `polys` holds every
+// exact shape (the rock's silhouette plus its crystals), like the server's rock.polys. Explosion
+// particles are decorative and not included.
 function rockShape(rock) {
   const app = rockAppearance.get(rock.id);
   const shape = rockShapes[rock.texturePath];
@@ -254,9 +608,83 @@ function rockShape(rock) {
     app.poly = transformPoly(shape.localPoly, 0, 0, app.angle);
     app.hull = transformPoly(shape.hull, 0, 0, app.angle);
     app.boundR = shape.boundR;
+    app.polys = [app.poly];
+    for (const [ti, cx, cy, step] of rock.cr || []) {
+      const t = shapeTextures[ti];
+      if (!t) continue;
+      for (const lp of t.polys) {
+        const poly = transformPoly(transformPoly(lp, cx, cy, crystalRot(step)), 0, 0, app.angle);
+        app.polys.push(poly);
+        for (const [x, y] of poly) app.boundR = Math.max(app.boundR, Math.hypot(x, y));
+      }
+    }
     app.shapeAngle = app.angle;
   }
   return app;
+}
+
+// Shape texture filled with a solid color (its shape only), cached per texture and color. Rendered at
+// SHAPE_RES × native size so it stays crisp when the world zoom scales it up.
+const SHAPE_RES = 3;
+const shapeSilhouettes = new Map(); // `${texIdx}:${color}` → canvas
+function shapeSilhouette(ti, color) {
+  const key = `${ti}:${color}`;
+  let c = shapeSilhouettes.get(key);
+  if (c) return c;
+  const t = shapeTextures[ti];
+  const img = t && texImg(t.path);
+  if (!img || !img._loaded) return null;
+  c = document.createElement('canvas');
+  c.width = Math.ceil(t.w * SHAPE_RES);
+  c.height = Math.ceil(t.h * SHAPE_RES);
+  const g = c.getContext('2d');
+  g.drawImage(img, 0, 0, c.width, c.height);
+  g.globalCompositeOperation = 'source-in';
+  g.fillStyle = color || '#ffffff';
+  g.fillRect(0, 0, c.width, c.height);
+  shapeSilhouettes.set(key, c);
+  return c;
+}
+
+// One shape centered at the current origin, rotated by `rot`, at `alpha` (multiplied with the current alpha).
+function drawShapeAt(ti, color, rot, alpha) {
+  const t = shapeTextures[ti];
+  const sil = shapeSilhouette(ti, color);
+  if (!t || !sil || !(alpha > 0)) return;
+  ctx.save();
+  ctx.rotate(rot);
+  ctx.globalAlpha *= alpha;
+  ctx.drawImage(sil, -t.w / 2, -t.h / 2, t.w, t.h);
+  ctx.restore();
+}
+
+// Attached pieces ([ti, x, y, step, ci] rows), in the rock's local (rotated) frame. alphaOf(i) → 0..1 extra.
+function drawRockPieces(rows, info, count, alphaOf) {
+  const step = info.rotationStepDeg * Math.PI / 180;
+  for (let i = 0; i < count; i++) {
+    const [ti, cx, cy, st, ci] = rows[i];
+    ctx.save();
+    ctx.translate(cx, cy);
+    drawShapeAt(ti, info.colors[ci], st * step, info.opacity * (alphaOf ? alphaOf(i) : 1));
+    ctx.restore();
+  }
+}
+function drawRockCrystals(rock) {
+  drawRockPieces(rock.cr, crystalInfo, rock.cr.length);
+}
+
+// Explosion particles on a damaged rock: the first round(max × damage fraction) slots, each fading in
+// over popInTime from when it became visible (tracked on the rock's appearance entry).
+function drawExplosionParticles(rock) {
+  const app = rockAppearance.get(rock.id);
+  if (!app) return;
+  const E = explosionInfo, max = Math.min(E.maxParticles, rock.ep.length);
+  const frac = rock.maxHp > 0 ? Math.max(0, Math.min(1, 1 - rock.hp / rock.maxHp)) : 0;
+  const visible = Math.min(max, Math.round(max * frac));
+  const now = performance.now() / 1000;
+  app.epShownAt = app.epShownAt || [];
+  for (let i = 0; i < visible; i++) if (app.epShownAt[i] == null) app.epShownAt[i] = now;
+  drawRockPieces(rock.ep, E, visible, i => Math.min(1, (now - app.epShownAt[i]) / E.popInTime));
 }
 
 // Dev: ?debughit=1 draws rock polygons/hulls, ship circles and server bullet hit points.
@@ -275,7 +703,9 @@ const MINIMAP_EXPANDED_CHUNKS    = 4;     // → 8×8 chunk area
 const XP_MARKER_HALF_W       = 3;     // px on the minimap (≈2× the old marker)
 const XP_MARKER_PULSE        = 0.15;  // ± size
 const XP_MARKER_PULSE_PERIOD = 1.0;   // s
-const CORNER_PAD = 32;
+const HUD_CORNER_MARGIN = 32; // ref px: minimap from the window's right/bottom edges
+const UPGRADE_BAR_GAP   = 32; // ref px between the upgrade bar and the minimap
+const CLASS_MENU_TOP    = 64; // ref px from the window top to the level-15 class menu
 
 const MAX_LEVEL = 99;
 const LEVEL_THRESHOLDS = (() => {
@@ -285,10 +715,11 @@ const LEVEL_THRESHOLDS = (() => {
   return t;
 })();
 
+// Mirror of server.js AWARD_LEVELS: every level 2–15, odd levels 17–29, then 33 and 36 (23 points).
 const AWARD_LEVELS = new Set([
-  ...Array.from({ length: 29 }, (_, i) => i + 1),
-  ...Array.from({ length: 16 }, (_, i) => 30 + i * 2),
-  ...Array.from({ length: 13 }, (_, i) => 63 + i * 3),
+  ...Array.from({ length: 14 }, (_, i) => 2 + i),      // 2..15
+  ...Array.from({ length: 7 }, (_, i) => 17 + i * 2),  // 17, 19, …, 29
+  33, 36,
 ]);
 
 function getLevelInfo(totalXp) {
@@ -384,25 +815,28 @@ const localPlayer = {
   respawnTimer: 0,
   shipType: 'basic',
   upgrades: Object.fromEntries(UPGRADE_DEFS_CLIENT.map(d => [d.id, 0])),
-  turnSpeed: TURN_SPEED,
+  move: null, // effective movement stats from the server (see 'init' / msg.move)
 };
 
 let deathPoint = null;
 let prevDead = false;
 
 // Server-authoritative state
+// Remote ships by id: other players, plus AI pirates (flag `pirate`, ids from 1,000,000; never players).
 const remotePlayers = new Map();
+let pirateDebug = false; // dev: F9 overlay with each pirate's AI state
 let serverRocks = [];
 let serverGems = [];
 let serverXpDrops = [];
 let serverBullets = [];
+let serverShards = [];  // flying particles (crystal shards, explosion particles): { id, x0, y0, dx, dy, age, rg, lf, rot, tex, c, k }
 
 // --- Input ---
 
 const keys = new Set();
 const upgradeFlashTime = new Array(UPGRADE_DEFS_CLIENT.length).fill(-1);
 let upgradeBarHidden = true;
-let upgradeBarSlideY = 112 + 32; // start fully off-screen (btnH + CORNER_PAD)
+let upgradeBarSlideY = 112 + 32 + 12; // ref px; starts fully hidden below the window (hiddenSlide in drawUpgradeBar)
 let _prevUpgradePoints = 0;
 window.addEventListener("keydown", e => {
   const typing = document.activeElement && document.activeElement.tagName === 'INPUT';
@@ -418,6 +852,18 @@ window.addEventListener("keydown", e => {
   }
   if (e.key === 'u' || e.key === 'U') {
     upgradeBarHidden = !upgradeBarHidden;
+  }
+  // Dev only (Vite dev server; stripped from production builds): P spawns a pirate group near us,
+  // F9 toggles the pirate AI debug overlay. The server also refuses these in production.
+  if (import.meta.env.DEV && !typing && !e.repeat && ws && ws.readyState === 1) {
+    if ((e.key === 'p' || e.key === 'P') && !CHEATS.some(code => (cheatBuffer + e.key.toLowerCase()).endsWith(code))) {
+      ws.send(JSON.stringify({ type: 'devPirates' }));
+    }
+    if (e.key === 'F9') {
+      e.preventDefault();
+      pirateDebug = !pirateDebug;
+      ws.send(JSON.stringify({ type: 'pirateDebug', on: pirateDebug }));
+    }
   }
   keys.add(e.key.toLowerCase());
   if (e.key === ' ') {
@@ -492,9 +938,21 @@ function handleMessage(event) {
     localPlayer.color = msg.color;
     rockShapes = msg.rockShapes || {};
     rockKinds = msg.rockKinds || {};
+    if (msg.shapeTextures) {
+      shapeTextures = msg.shapeTextures;
+      for (const t of shapeTextures) texImg(t.path); // warm the cache
+    }
+    if (msg.crystals) crystalInfo = msg.crystals;
+    if (msg.explosions) explosionInfo = msg.explosions;
     if (msg.shipTypes) shipTypes = msg.shipTypes;
     if (msg.bulletTypes) bulletTypes = msg.bulletTypes;
     if (msg.shipTextureScale) shipTextureScale = msg.shipTextureScale;
+    if (msg.pickupTextures) {
+      pickupTextures = msg.pickupTextures;
+      for (const denoms of Object.values(pickupTextures)) // warm the texture cache
+        for (const list of Object.values(denoms)) for (const t of list) texImg(t.path);
+    }
+    if (msg.move) localPlayer.move = msg.move;
     serverRocks = msg.rocks;
     serverGems = msg.gems;
     syncRockAppearance(serverRocks);
@@ -504,12 +962,14 @@ function handleMessage(event) {
   }
 
   else if (msg.type === 'tick') {
+    if (msg.move) localPlayer.move = msg.move; // class switch, upgrade, respawn
     // Before replacing serverRocks, so shatters start from the local interpolated rock.
     if (msg.brokenRocks) handleBrokenRocks(msg.brokenRocks);
     // Visual feedback events; pickups before gems/xp lists are replaced, so the pop starts from our copy.
     if (msg.hits) handleHitEvents(msg.hits);
     if (msg.pickups) handlePickupEvents(msg.pickups);
-    if (msg.playerDied) handlePlayerDiedEvents(msg.playerDied); // before positions update: shatter from our copy
+    if (msg.playerDied) handlePlayerDiedEvents(msg.playerDied);
+    if (msg.blasts) handleBlastEvents(msg.blasts); // before positions update: shatter from our copy
     if (msg.rocks   !== undefined) { serverRocks = msg.rocks; syncRockAppearance(serverRocks); }
     if (msg.gems    !== undefined) serverGems    = msg.gems;
     if (msg.xpDrops !== undefined) serverXpDrops = msg.xpDrops || [];
@@ -524,12 +984,22 @@ function handleMessage(event) {
       });
     }
 
+    // Merge shards: the flight is a fixed curve from (x0, y0) along (dx, dy), so we only need its age.
+    // Known shards keep their locally advanced age (smooth), unless it drifted far from the server's.
+    if (msg.shards) {
+      const prev = new Map(serverShards.map(sh => [sh.id, sh]));
+      serverShards = msg.shards.map(sh => {
+        const old = prev.get(sh.id);
+        return old && Math.abs(old.age - sh.age) < 0.1 ? { ...sh, age: old.age } : sh;
+      });
+    }
+
     const seen = new Set();
     for (const p of msg.players) {
       trackLevelUp(p);
       const respawned = trackRespawn(p);
       if (p.id === myId) {
-        if (respawned) { localPlayer.x = p.x; localPlayer.y = p.y; } // appear at the spawn, don't glide there
+        if (respawned) { localPlayer.x = p.x; localPlayer.y = p.y; hudPanelSnapRequested = true; } // appear at the spawn, don't glide there; HUD bars snap
         localPlayer.x = wrapX(localPlayer.x + torusDelta(p.x, localPlayer.x, WORLD_W) * 0.15);
         localPlayer.y = wrapY(localPlayer.y + torusDelta(p.y, localPlayer.y, WORLD_H) * 0.15);
         localPlayer.hp = p.hp;
@@ -542,7 +1012,6 @@ function handleMessage(event) {
         localPlayer.level = p.level ?? localPlayer.level;
         localPlayer.upgradePoints = p.upgradePoints ?? localPlayer.upgradePoints;
         localPlayer.upgrades = p.upgrades || localPlayer.upgrades;
-        localPlayer.turnSpeed = p.turnSpeed || TURN_SPEED;
         localPlayer.shipType = p.shipType || 'basic';
         if (p.dead) { localPlayer.vx = 0; localPlayer.vy = 0; }
       } else {
@@ -555,6 +1024,13 @@ function handleMessage(event) {
         });
         seen.add(p.id);
       }
+    }
+    // Pirates: drawn and interpolated like remote players (tint, trail, hit flash, death shatter), but
+    // no nickname, level or player-list behavior.
+    for (const q of msg.pirates || []) {
+      const existing = remotePlayers.get(q.id);
+      remotePlayers.set(q.id, { ...q, renderX: existing ? existing.renderX : q.x, renderY: existing ? existing.renderY : q.y });
+      seen.add(q.id);
     }
     if (msg.online != null) onlineCount = msg.online;
     for (const [id] of remotePlayers) {
@@ -618,7 +1094,12 @@ function checkLocalPlayerRockCollisions() {
     const cdy = torusDelta(localPlayer.y, rock.y, WORLD_H);
     if (cdx * cdx + cdy * cdy >= (pr + shape.boundR) ** 2) continue;
 
-    const contact = circleVsPolygon(cdx, cdy, pr, shape.poly);
+    // Deepest contact over the rock's exact shapes (silhouette and attached crystals), as on the server.
+    let contact = null;
+    for (const poly of shape.polys) {
+      const c = circleVsPolygon(cdx, cdy, pr, poly);
+      if (c && (!contact || c.depth > contact.depth)) contact = c;
+    }
     if (!contact) continue;
     const nx = contact.nx, ny = contact.ny, overlap = contact.depth;
 
@@ -647,14 +1128,15 @@ function checkLocalPlayerRockCollisions() {
 // --- Client-side prediction ---
 
 function update(dt) {
-  if (localPlayer.dead || myId === null) {
+  if (localPlayer.dead || myId === null || !localPlayer.move) {
     inputTimer += dt;
     if (inputTimer >= INPUT_INTERVAL) { sendInput(); inputTimer = Math.min(inputTimer - INPUT_INTERVAL, INPUT_INTERVAL); }
     return;
   }
 
   // Turning: Q/E/A/D rotate the ship heading; speed scales with Ship Agility upgrade
-  const ts = localPlayer.turnSpeed || TURN_SPEED;
+  const mv = localPlayer.move;
+  const ts = mv.turnSpeed;
   if (keys.has('q') || keys.has('a') || keys.has('arrowleft')) aimAngle -= ts * dt;
   if (keys.has('e') || keys.has('d') || keys.has('arrowright')) aimAngle += ts * dt;
 
@@ -682,21 +1164,21 @@ function update(dt) {
   const fx = Math.cos(localPlayer.angle), fy = Math.sin(localPlayer.angle);
   const lx = -fy, ly = fx; // lateral (perpendicular) unit vector
 
-  localPlayer.vx += fx * currentThrust * PLAYER_ACCEL * dt;
-  localPlayer.vy += fy * currentThrust * PLAYER_ACCEL * dt;
+  localPlayer.vx += fx * currentThrust * mv.accel * dt;
+  localPlayer.vy += fy * currentThrust * mv.accel * dt;
 
   // Decompose into forward/lateral, apply separate drag
   const fwdSpd = localPlayer.vx * fx + localPlayer.vy * fy;
   const latSpd = localPlayer.vx * lx + localPlayer.vy * ly;
-  const fwdNew = fwdSpd * Math.exp(-FWD_DRAG * dt);
-  const latNew = latSpd * Math.exp(-LAT_DRAG * dt);
+  const fwdNew = fwdSpd * Math.exp(-mv.fwdDrag * dt);
+  const latNew = latSpd * Math.exp(-mv.latDrag * dt);
   localPlayer.vx = fwdNew * fx + latNew * lx;
   localPlayer.vy = fwdNew * fy + latNew * ly;
 
   const spd = Math.hypot(localPlayer.vx, localPlayer.vy);
-  if (spd > PLAYER_MAX_SPEED) {
-    localPlayer.vx *= PLAYER_MAX_SPEED / spd;
-    localPlayer.vy *= PLAYER_MAX_SPEED / spd;
+  if (spd > mv.maxSpeed) {
+    localPlayer.vx *= mv.maxSpeed / spd;
+    localPlayer.vy *= mv.maxSpeed / spd;
   }
 
   localPlayer.x = wrapX(localPlayer.x + localPlayer.vx * dt);
@@ -719,6 +1201,8 @@ function update(dt) {
     b.x = wrapX(b.x + b.vx * dt);
     b.y = wrapY(b.y + b.vy * dt);
   }
+  for (const sh of serverShards) sh.age += dt; // position follows from the age (shardDistance)
+  serverShards = serverShards.filter(sh => sh.age < sh.lf);
 
   // Extrapolate gems with drag
   for (const g of serverGems) {
@@ -797,19 +1281,19 @@ function drawGrid(camX, camY) {
   ctx.strokeStyle = "rgba(255,255,255,0.05)";
   ctx.lineWidth = 1;
 
-  const startX = Math.floor((camX - canvas.width / 2) / gridSize) * gridSize;
-  const endX = Math.floor((camX + canvas.width / 2) / gridSize) * gridSize;
-  const startY = Math.floor((camY - canvas.height / 2) / gridSize) * gridSize;
-  const endY = Math.floor((camY + canvas.height / 2) / gridSize) * gridSize;
+  const startX = Math.floor((camX - viewW / 2) / gridSize) * gridSize;
+  const endX = Math.floor((camX + viewW / 2) / gridSize) * gridSize;
+  const startY = Math.floor((camY - viewH / 2) / gridSize) * gridSize;
+  const endY = Math.floor((camY + viewH / 2) / gridSize) * gridSize;
 
   ctx.beginPath();
   for (let x = startX; x <= endX; x += gridSize) {
-    ctx.moveTo(x - camX + canvas.width / 2, startY - camY + canvas.height / 2);
-    ctx.lineTo(x - camX + canvas.width / 2, endY - camY + canvas.height / 2);
+    ctx.moveTo(x - camX + viewW / 2, startY - camY + viewH / 2);
+    ctx.lineTo(x - camX + viewW / 2, endY - camY + viewH / 2);
   }
   for (let y = startY; y <= endY; y += gridSize) {
-    ctx.moveTo(startX - camX + canvas.width / 2, y - camY + canvas.height / 2);
-    ctx.lineTo(endX - camX + canvas.width / 2, y - camY + canvas.height / 2);
+    ctx.moveTo(startX - camX + viewW / 2, y - camY + viewH / 2);
+    ctx.lineTo(endX - camX + viewW / 2, y - camY + viewH / 2);
   }
   ctx.stroke();
 }
@@ -982,11 +1466,11 @@ function drawRocks(camX, camY) {
   for (const rock of serverRocks) {
     const dx = torusDelta(rock.x, camX, WORLD_W);
     const dy = torusDelta(rock.y, camY, WORLD_H);
-    const sx = canvas.width / 2 + dx;
-    const sy = canvas.height / 2 + dy;
+    const sx = viewW / 2 + dx;
+    const sy = viewH / 2 + dy;
 
-    const margin = rock.r + 40;
-    if (sx < -margin || sx > canvas.width + margin || sy < -margin || sy > canvas.height + margin) continue;
+    const margin = rock.r + 80; // room for crystals sticking out
+    if (sx < -margin || sx > viewW + margin || sy < -margin || sy > viewH + margin) continue;
 
     const drawSize = rock.r * 2;
     // Knock-and-snap: a visual-only offset/twitch after a hit (position, physics and hitbox untouched).
@@ -997,19 +1481,27 @@ function drawRocks(camX, camY) {
     const img = rock.texturePath ? loadRockTexture(rock.texturePath) : null;
     if (!img || !img._loaded) continue;
 
+    // Explosion fragments fade out over their last fragmentFadeTime seconds (server removes them at 0).
+    const fade = rock.ttl != null ? Math.max(0, Math.min(1, rock.ttl / explosionInfo.fragmentFadeTime)) : 1;
+    if (!(fade > 0)) continue;
+
     ctx.save();
     ctx.translate(knock ? sx + knock.dx : sx, knock ? sy + knock.dy : sy);
     ctx.rotate(angle);
+    ctx.globalAlpha = fade;
+    if (rock.cr && !crystalInfo.drawOnTop) drawRockCrystals(rock);
     ctx.drawImage(img, -drawSize / 2, -drawSize / 2, drawSize, drawSize);
 
     // Biome tint over the rock (cached silhouette, only ever drawn from).
     const silhouette = tint && getRockSilhouette(rock.texturePath, tint.color);
     if (silhouette) {
       ctx.save();
-      ctx.globalAlpha = tint.alpha;
+      ctx.globalAlpha = tint.alpha * fade;
       ctx.drawImage(silhouette, -drawSize / 2, -drawSize / 2, drawSize, drawSize);
       ctx.restore();
     }
+    if (rock.cr && crystalInfo.drawOnTop) drawRockCrystals(rock);
+    if (rock.ep) drawExplosionParticles(rock);
 
     ctx.restore();
   }
@@ -1075,9 +1567,9 @@ function pickXpParticleSpot(poly) {
 }
 
 function isRockOnScreen(rock, camX, camY, pad) {
-  const sx = canvas.width / 2 + torusDelta(rock.x, camX, WORLD_W);
-  const sy = canvas.height / 2 + torusDelta(rock.y, camY, WORLD_H);
-  return sx > -pad && sx < canvas.width + pad && sy > -pad && sy < canvas.height + pad;
+  const sx = viewW / 2 + torusDelta(rock.x, camX, WORLD_W);
+  const sy = viewH / 2 + torusDelta(rock.y, camY, WORLD_H);
+  return sx > -pad && sx < viewW + pad && sy > -pad && sy < viewH + pad;
 }
 
 // Particle state lives on the rock's appearance entry, so it disappears the moment the rock breaks
@@ -1122,8 +1614,8 @@ function drawXpParticles(camX, camY) {
     if (!size) continue;
     const [ox, oy] = xpParticleCenter(shape.poly, p.edge, p.t);
     // Whole screen pixels; frame sizes are even so every vertex lands on a pixel.
-    const cx = Math.round(canvas.width / 2 + torusDelta(rock.x, camX, WORLD_W) + ox);
-    const cy = Math.round(canvas.height / 2 + torusDelta(rock.y, camY, WORLD_H) + oy);
+    const cx = Math.round(viewW / 2 + torusDelta(rock.x, camX, WORLD_W) + ox);
+    const cy = Math.round(viewH / 2 + torusDelta(rock.y, camY, WORLD_H) + oy);
     const hw = size[0] / 2, hh = size[1] / 2;
     ctx.fillStyle = rockAccentCache.get(rock.texturePath) || XP_PARTICLE_FALLBACK;
     ctx.beginPath();
@@ -1135,6 +1627,122 @@ function drawXpParticles(camX, camY) {
     ctx.fill();
   }
   ctx.restore(); // restores globalAlpha
+}
+
+// --- Gold rock particles (visual only) ---
+// Like the XP particles (same frame timing, scale steps and opacity), but each particle is one of the
+// gold particle SVGs, drawn 1:1 at its peak frame. Gold rocks are bigger, so each runs several
+// independent slots with shorter gaps. Spots are stored in the texture's unrotated frame and rotated
+// with the rock every frame; state lives on the rock's appearance entry, so particles vanish the
+// moment the rock breaks or leaves view.
+
+const GOLD_PARTICLE_FILES = [
+  'big/biggold1.svg', 'big/biggold2.svg',
+  'small/smallgold1.svg', 'small/smallgold2.svg', 'small/smallgold3.svg',
+];
+// Scale per frame relative to the SVG's own size: the XP frames' steps (8→16→8 wide = 0.5, 1, 0.5).
+const GOLD_PARTICLE_SCALES        = XP_PARTICLE_FRAMES.map(([w]) => w / XP_PARTICLE_FRAMES[1][0]);
+const GOLD_PARTICLE_GAP_MIN       = XP_PARTICLE_GAP_MIN / 2; // s between particles in one slot
+const GOLD_PARTICLE_GAP_MAX       = XP_PARTICLE_GAP_MAX / 2;
+const GOLD_PARTICLE_SLOTS_SMALL   = 2;     // max active at once on 208–224 rocks...
+const GOLD_PARTICLE_SLOTS_LARGE   = 3;     // ...and on 240–256 rocks
+const GOLD_PARTICLE_LARGE_R       = 120;   // r at or above this counts as large (240 px texture)
+const GOLD_PARTICLE_INSIDE_CHANCE = 0.15;  // else a point on the contour
+const GOLD_PARTICLE_INSIDE_TRIES  = 16;    // random points tried inside the silhouette before using the contour
+
+const goldParticleImgs = GOLD_PARTICLE_FILES.map(f => makeImg(`/textures/particles/goldrock/${f}`));
+
+// Contour length table per texture, for uniform points along the outline.
+const goldContourCache = new Map(); // texturePath → { cum, total }
+function goldContour(path, poly) {
+  let c = goldContourCache.get(path);
+  if (!c) {
+    const cum = [0];
+    for (let i = 0; i < poly.length; i++) {
+      const [ax, ay] = poly[i], [bx, by] = poly[(i + 1) % poly.length];
+      cum.push(cum[i] + Math.hypot(bx - ax, by - ay));
+    }
+    c = { cum, total: cum[poly.length] };
+    goldContourCache.set(path, c);
+  }
+  return c;
+}
+
+// Random spot in the texture's unrotated frame: usually on the contour, sometimes inside the silhouette.
+function pickGoldParticleSpot(path, poly) {
+  if (Math.random() < GOLD_PARTICLE_INSIDE_CHANCE) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const [x, y] of poly) { minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y); }
+    for (let i = 0; i < GOLD_PARTICLE_INSIDE_TRIES; i++) {
+      const x = minX + Math.random() * (maxX - minX), y = minY + Math.random() * (maxY - minY);
+      if (pointInPolygon(x, y, poly)) return { x, y };
+    }
+  }
+  const { cum, total } = goldContour(path, poly);
+  const d = Math.random() * total;
+  let i = 0;
+  while (i < poly.length - 1 && cum[i + 1] < d) i++;
+  const [ax, ay] = poly[i], [bx, by] = poly[(i + 1) % poly.length];
+  const t = (d - cum[i]) / ((cum[i + 1] - cum[i]) || 1);
+  return { x: ax + (bx - ax) * t, y: ay + (by - ay) * t };
+}
+
+function goldParticleGap() {
+  return GOLD_PARTICLE_GAP_MIN + Math.random() * (GOLD_PARTICLE_GAP_MAX - GOLD_PARTICLE_GAP_MIN);
+}
+
+// Same slot cycle as updateXpParticles: a particle lives its frames, then the slot waits a gap.
+function updateGoldParticles(dt) {
+  const fdt = dt / FX_SLOW;
+  const life = XP_PARTICLE_FRAME_TIME * XP_PARTICLE_FRAMES.length;
+  for (const rock of serverRocks) {
+    if (rock.k !== 'gold') continue;
+    const app = rockAppearance.get(rock.id);
+    const poly = rockShapes[rock.texturePath]?.localPoly;
+    if (!app || !poly) continue;
+    if (!app.goldSlots) { // random starting phase per slot, so rocks and slots are out of sync
+      const n = rock.r >= GOLD_PARTICLE_LARGE_R ? GOLD_PARTICLE_SLOTS_LARGE : GOLD_PARTICLE_SLOTS_SMALL;
+      app.goldSlots = Array.from({ length: n }, () => ({ timer: Math.random() * GOLD_PARTICLE_GAP_MAX, p: null }));
+    }
+    for (const slot of app.goldSlots) {
+      if (slot.p) {
+        slot.p.age += fdt;
+        if (slot.p.age < life) continue;
+        slot.p = null;
+        slot.timer = goldParticleGap();
+      }
+      slot.timer -= fdt;
+      if (slot.timer > 0) continue;
+      slot.timer = goldParticleGap();
+      if (!isRockOnScreen(rock, localPlayer.x, localPlayer.y, rock.r * 2)) continue;
+      const img = goldParticleImgs[Math.floor(Math.random() * goldParticleImgs.length)];
+      slot.p = { ...pickGoldParticleSpot(rock.texturePath, poly), img, age: 0 };
+    }
+  }
+}
+
+// Same layer, opacity and pixel snapping as the XP particles; no biome tint (particles never get it).
+function drawGoldParticles(camX, camY) {
+  ctx.save();
+  ctx.globalAlpha = XP_PARTICLE_OPACITY;
+  for (const rock of serverRocks) {
+    if (rock.k !== 'gold') continue;
+    const app = rockAppearance.get(rock.id);
+    if (!app?.goldSlots || !isRockOnScreen(rock, camX, camY, rock.r * 2)) continue;
+    const c = Math.cos(app.angle), sn = Math.sin(app.angle); // same rotation as rockShape's poly
+    const rx = viewW / 2 + torusDelta(rock.x, camX, WORLD_W);
+    const ry = viewH / 2 + torusDelta(rock.y, camY, WORLD_H);
+    for (const slot of app.goldSlots) {
+      const p = slot.p;
+      const scale = p && GOLD_PARTICLE_SCALES[Math.floor(p.age / XP_PARTICLE_FRAME_TIME)];
+      if (!scale || !p.img._loaded) continue;
+      const w = Math.max(1, Math.round((p.img.naturalWidth || 32) * scale));
+      const h = Math.max(1, Math.round((p.img.naturalHeight || 32) * scale));
+      const cx = rx + p.x * c - p.y * sn, cy = ry + p.x * sn + p.y * c;
+      ctx.drawImage(p.img, Math.round(cx - w / 2), Math.round(cy - h / 2), w, h);
+    }
+  }
+  ctx.restore();
 }
 
 // --- Shatter effect (visual only) ---
@@ -1219,7 +1827,7 @@ function spawnShatter(rock, opts = {}) {
   // Skip entirely if the rock is off-screen.
   const dxCam = torusDelta(rock.x, localPlayer.x, WORLD_W);
   const dyCam = torusDelta(rock.y, localPlayer.y, WORLD_H);
-  if (Math.abs(dxCam) > canvas.width / 2 + r * 2 || Math.abs(dyCam) > canvas.height / 2 + r * 2) return;
+  if (Math.abs(dxCam) > viewW / 2 + r * 2 || Math.abs(dyCam) > viewH / 2 + r * 2) return;
 
   const sizeT = (r - cfg.rSmall) / (cfg.rLarge - cfg.rSmall);
 
@@ -1334,9 +1942,9 @@ function drawShatterEffects(camX, camY) {
       const travel = dragTravel(fx.age, cfg.drag);
       for (const p of fx.pieces) {
         // Sub-pixel positions (no rounding): continuous motion without 1px jumps.
-        const sx = canvas.width / 2 + torusDelta(p.x0 + p.vx * travel, camX, WORLD_W);
-        const sy = canvas.height / 2 + torusDelta(p.y0 + p.vy * travel, camY, WORLD_H);
-        if (sx < -r * 2 || sx > canvas.width + r * 2 || sy < -r * 2 || sy > canvas.height + r * 2) continue;
+        const sx = viewW / 2 + torusDelta(p.x0 + p.vx * travel, camX, WORLD_W);
+        const sy = viewH / 2 + torusDelta(p.y0 + p.vy * travel, camY, WORLD_H);
+        if (sx < -r * 2 || sx > viewW + r * 2 || sy < -r * 2 || sy > viewH + r * 2) continue;
         ctx.save();
         ctx.globalAlpha = alpha;
         ctx.translate(sx, sy);
@@ -1368,8 +1976,8 @@ function drawShatterEffects(camX, camY) {
       ctx.globalAlpha = 1 - de;
       ctx.fillStyle = '#ffffff';
       for (const d of fx.dust) {
-        const sx = canvas.width / 2 + torusDelta(d.x0 + d.vx * travel, camX, WORLD_W) - size / 2;
-        const sy = canvas.height / 2 + torusDelta(d.y0 + d.vy * travel, camY, WORLD_H) - size / 2;
+        const sx = viewW / 2 + torusDelta(d.x0 + d.vx * travel, camX, WORLD_W) - size / 2;
+        const sy = viewH / 2 + torusDelta(d.y0 + d.vy * travel, camY, WORLD_H) - size / 2;
         ctx.fillRect(sx, sy, size, size);
       }
       ctx.restore();
@@ -1447,13 +2055,23 @@ const CHIP_DRAG              = 4;     // 1/s
 const CHIP_INSET             = 0.6;   // chip center moved this × chip size inside the rim, so it holds rock
 
 // Engine trail: one smooth tapered ribbon per engine, following the engine's recent path.
-const TRAIL_HISTORY          = 0.7;   // s of path kept while thrusting
-const TRAIL_WIDTH            = 8;     // px at the engine, tapering to 0 at the tail
-const TRAIL_ALPHA            = 0.6;   // opacity at the engine, fading to 0 at the tail
-const TRAIL_FADE_TIME        = 0.3;   // s a detached trail (thrust stopped) takes to shorten and fade out
-const TRAIL_MIN_STEP         = 2;     // px: closer samples just move the head point
-const TRAIL_MAX_JUMP         = 150;   // px between frames: bigger (respawn/teleport) starts a new ribbon
-const TRAIL_BACK_OFFSET      = 4;     // px behind the engine point
+// Engine trail: squares in the ship's color, emitted per engine point while thrusting forward. Each keeps
+// the ship's facing at spawn, is scattered around the engine point, drifts slowly in a random direction
+// (easing to a stop) and fades out smoothly (ease-out: quick dim, then a long tail).
+const TRAIL_CONFIG = {
+  size: 8,                    // world units, square side
+  spacing: 12,                // world units the engine travels between squares
+  life: 0.25,                 // s each square lives
+  maxAlpha: 0.6,              // opacity at spawn
+  fadePower: 2,               // alpha = maxAlpha × (1 − t)^fadePower, t = age / life (ease-out fade)
+  sideSpread: 5,              // ± world units across the ship's facing at spawn
+  forwardSpread: 3,           // ± world units along the ship's facing at spawn
+  driftSpeed: [10, 30],       // world units/s, random direction (not the ship's velocity)
+  driftSlowdown: 0.6,         // drift speed falls linearly to (1 − this) of its start over the life
+  backOffset: 4,              // world units behind the engine point
+  maxJump: 150,               // world units between frames: bigger (respawn/teleport) restarts without a streak
+  poolSize: 2048,             // fixed pool; the oldest square is reused when full
+};
 
 // Ship death: the player-colored ship shatters like a rock, with a few more pieces (biome tint via the
 // ship's silhouette).
@@ -1485,10 +2103,30 @@ const hitFlashPlayers = new Map();    // player id → s remaining
 const lastLevels = new Map();         // player id → last seen level
 const lastDeadState = new Map();      // player id → last seen dead flag
 const respawnFx = new Map();          // player id → s since respawn
-const trailRibbons = new Map();       // `${playerId}:${engine}` → active ribbon { points: [{x, y, t}], color }
-const detachedTrails = [];            // ribbons whose thrust stopped: { points, color, fadeAge }
-let fxClock = 0;                      // effect time (s, ?fxslow applies), for trail point ages
+// Trail squares: fixed pool, recycled round-robin. Emitters: per player, one state per engine point.
+const trailPool = Array.from({ length: TRAIL_CONFIG.poolSize },
+  () => ({ active: false, x: 0, y: 0, vx: 0, vy: 0, angle: 0, age: 0, color: '#ffffff' }));
+let trailNext = 0;
+const trailEmitters = new Map(); // playerId → { stamp, engines: [{ has, x, y, acc }] }
+let trailStamp = 0;              // frame counter; emitters not seen for a while are dropped
 let xpBarPulseAge = Infinity;
+
+// Explosion blasts: an expanding stepped ring, and the same knockback on our own ship as the server
+// applies (so local prediction doesn't fight it). Remote ships get theirs through their positions.
+function handleBlastEvents(events) {
+  const E = explosionInfo;
+  for (const ev of events) {
+    pushFx({ kind: 'blast', layer: 'world', life: E.ringDuration, x: ev.x, y: ev.y });
+    if (myId === null || localPlayer.dead) continue;
+    const dx = torusDelta(localPlayer.x, ev.x, WORLD_W), dy = torusDelta(localPlayer.y, ev.y, WORLD_H);
+    const dist = Math.hypot(dx, dy), pr = shipType(localPlayer.shipType).r;
+    const k = 1 - Math.max(0, dist - pr) / E.blastRadius;
+    if (k <= 0) continue;
+    const nx = dist > 1e-6 ? dx / dist : 1, ny = dist > 1e-6 ? dy / dist : 0;
+    localPlayer.vx += nx * E.knockbackShip * k;
+    localPlayer.vy += ny * E.knockbackShip * k;
+  }
+}
 
 function pushFx(e) {
   fxList.push({ age: 0, ...e });
@@ -1496,12 +2134,12 @@ function pushFx(e) {
 }
 
 function fxScreen(x, y) {
-  return [canvas.width / 2 + torusDelta(x, localPlayer.x, WORLD_W), canvas.height / 2 + torusDelta(y, localPlayer.y, WORLD_H)];
+  return [viewW / 2 + torusDelta(x, localPlayer.x, WORLD_W), viewH / 2 + torusDelta(y, localPlayer.y, WORLD_H)];
 }
 
 function fxOnScreen(x, y, pad = FX_CULL_PAD) {
   const [sx, sy] = fxScreen(x, y);
-  return sx > -pad && sx < canvas.width + pad && sy > -pad && sy < canvas.height + pad;
+  return sx > -pad && sx < viewW + pad && sy > -pad && sy < viewH + pad;
 }
 
 // Current position/heading of a player for effects that follow them (null if gone or dead).
@@ -1645,127 +2283,114 @@ function handlePickupEvents(events) {
     if (ev.kind === 'xp' && ev.playerId === myId) xpBarPulseAge = 0;
     const x = item?.x ?? ev.x, y = item?.y ?? ev.y;
     if (!fxOnScreen(x, y)) continue;
-    let img, size;
-    if (ev.kind === 'gold') {
-      const type = item?.coinType || 'small';
-      img = coinImgs[type]; size = COIN_SIZES[type] ?? 12;
-    } else {
-      const type = item?.xpType || 'small';
-      img = xpImgs[type][(item?.xpVariant || 1) - 1]; size = XP_SIZES[type] ?? 16;
-    }
-    pushFx({ kind: 'pickup', layer: 'world', life: PICKUP_POP_TIME, x, y, playerId: ev.playerId, img, size });
+    const t = item ? pickupTexture(ev.kind, item.v, item.tex) : null;
+    pushFx({ kind: 'pickup', layer: 'world', life: PICKUP_POP_TIME, x, y, playerId: ev.playerId,
+      img: t?.img, w: t?.w ?? 12, h: t?.h ?? 12, rot: item?.rot || 0 });
   }
 }
 
-// Engine trails: while a ship thrusts, each engine's world position is recorded every frame into
-// its ribbon; when thrust stops (or the ship dies/leaves) the ribbon detaches and fades out.
-// Points are stored unwrapped (each relative to the previous via torusDelta), so a ribbon stays
-// continuous across the world seam instead of streaking across the map.
+// Engine trails: while a ship thrusts forward, each engine point drops a square every TRAIL_CONFIG.spacing
+// world units it travels (distance measured with torusDelta, so the world seam never breaks the spacing).
+// A square at (x, y) for a ship facing `angle`: scattered sideways/forward, drifting in a random direction.
+function emitTrailSquare(x, y, color, angle) {
+  const C = TRAIL_CONFIG;
+  const q = trailPool[trailNext];
+  trailNext = (trailNext + 1) % trailPool.length;
+  const ca = Math.cos(angle), sa = Math.sin(angle);
+  const side = (Math.random() * 2 - 1) * C.sideSpread, fwd = (Math.random() * 2 - 1) * C.forwardSpread;
+  const driftDir = Math.random() * Math.PI * 2;
+  const speed = C.driftSpeed[0] + Math.random() * (C.driftSpeed[1] - C.driftSpeed[0]);
+  q.active = true;
+  q.x = wrapX(x + side * -sa + fwd * ca);
+  q.y = wrapY(y + side * ca + fwd * sa);
+  q.vx = Math.cos(driftDir) * speed;
+  q.vy = Math.sin(driftDir) * speed;
+  q.angle = angle;
+  q.age = 0;
+  q.color = color;
+}
+
+// Emitter state for a player's engines (rebuilt only when the engine count changes, e.g. class switch).
+function trailEmitterFor(id, n) {
+  let em = trailEmitters.get(id);
+  if (!em || em.engines.length !== n) {
+    em = { stamp: 0, engines: Array.from({ length: n }, () => ({ has: false, x: 0, y: 0, acc: 0 })) };
+    trailEmitters.set(id, em);
+  }
+  return em;
+}
+
+// One ship: while thrusting, drop a square every `spacing` units each engine travels (placed along the
+// path, so fast ships leave evenly spaced squares). No allocations per call.
+function recordTrail(id, x, y, angle, shipId, color, thrusting) {
+  const C = TRAIL_CONFIG;
+  const engines = shipType(shipId).engines || [];
+  const em = trailEmitterFor(id, engines.length);
+  em.stamp = trailStamp;
+  const ca = Math.cos(angle), sa = Math.sin(angle);
+  for (let i = 0; i < engines.length; i++) {
+    const st = em.engines[i];
+    if (!thrusting) { st.has = false; continue; }
+    const e = engines[i], fwd = e.forward - C.backOffset;
+    const ex = x + e.side * -sa + fwd * ca, ey = y + e.side * ca + fwd * sa; // shipPoint(), inlined
+    if (!st.has) { st.has = true; st.x = ex; st.y = ey; st.acc = 0; emitTrailSquare(ex, ey, color, angle); continue; }
+    const dx = torusDelta(ex, st.x, WORLD_W), dy = torusDelta(ey, st.y, WORLD_H);
+    const d = Math.hypot(dx, dy);
+    if (d > C.maxJump) { st.x = ex; st.y = ey; st.acc = 0; continue; }
+    const before = st.acc;
+    st.acc += d;
+    for (let k = 1; before < C.spacing * k && C.spacing * k <= st.acc; k++) {
+      const u = (C.spacing * k - before) / d; // fraction along this frame's segment
+      emitTrailSquare(st.x + dx * u, st.y + dy * u, color, angle);
+    }
+    st.acc %= C.spacing;
+    st.x = ex; st.y = ey;
+  }
+}
+
+function recordRemoteTrail(p) {
+  if (!p.dead) recordTrail(p.id, p.renderX ?? p.x, p.renderY ?? p.y, p.angle, p.shipType, p.color || '#ffffff', !!p.th);
+}
+function dropStaleEmitter(em, id) {
+  if (trailStamp - em.stamp > 60) trailEmitters.delete(id);
+}
+
 function updateEngineTrails(fdt) {
-  fxClock += fdt;
-  const seen = new Set();
-  const detach = (key, rb) => {
-    trailRibbons.delete(key);
-    if (rb.points.length >= 2) detachedTrails.push({ points: rb.points, color: rb.color, fadeAge: 0 });
-  };
-  const record = (id, x, y, angle, shipId, color, thrusting) => {
-    if (!thrusting) return;
-    const engines = shipType(shipId).engines || [];
-    const back = angle + Math.PI;
-    for (let i = 0; i < engines.length; i++) {
-      const key = `${id}:${i}`;
-      const e = enginePoint(shipTypes, shipId, i, x, y, angle);
-      const px = e.x + Math.cos(back) * TRAIL_BACK_OFFSET, py = e.y + Math.sin(back) * TRAIL_BACK_OFFSET;
-      seen.add(key);
-      let rb = trailRibbons.get(key);
-      const last = rb && rb.points[rb.points.length - 1];
-      const dx = last ? torusDelta(px, last.x, WORLD_W) : 0, dy = last ? torusDelta(py, last.y, WORLD_H) : 0;
-      if (rb && Math.hypot(dx, dy) > TRAIL_MAX_JUMP) { detach(key, rb); rb = null; }
-      if (!rb) { rb = { points: [], color }; trailRibbons.set(key, rb); }
-      rb.color = color;
-      const prev = rb.points[rb.points.length - 1];
-      if (prev && Math.hypot(dx, dy) < TRAIL_MIN_STEP) { prev.x += dx; prev.y += dy; continue; } // head follows the engine
-      rb.points.push(prev ? { x: prev.x + dx, y: prev.y + dy, t: fxClock } : { x: px, y: py, t: fxClock });
-    }
-  };
+  trailStamp++;
   if (myId !== null && !localPlayer.dead) {
-    record(myId, localPlayer.x, localPlayer.y, localPlayer.angle, localPlayer.shipType, localPlayer.color || '#ffffff', currentThrust > 0);
+    recordTrail(myId, localPlayer.x, localPlayer.y, localPlayer.angle, localPlayer.shipType, localPlayer.color || '#ffffff', currentThrust > 0);
   }
-  for (const [, p] of remotePlayers) {
-    if (!p.dead) record(p.id, p.renderX ?? p.x, p.renderY ?? p.y, p.angle, p.shipType, p.color || '#ffffff', !!p.th);
-  }
-  for (const [key, rb] of trailRibbons) {
-    if (!seen.has(key)) { detach(key, rb); continue; }
-    while (rb.points.length > 2 && fxClock - rb.points[0].t > TRAIL_HISTORY) rb.points.shift();
-  }
-  // Detached: the kept window shrinks to nothing over TRAIL_FADE_TIME (shortens from the tail) while fading.
-  for (let i = detachedTrails.length - 1; i >= 0; i--) {
-    const d = detachedTrails[i];
-    d.fadeAge += fdt;
-    const windowS = TRAIL_HISTORY * (1 - d.fadeAge / TRAIL_FADE_TIME);
-    while (d.points.length && fxClock - d.points[0].t > windowS) d.points.shift();
-    if (d.fadeAge >= TRAIL_FADE_TIME || d.points.length < 2) detachedTrails.splice(i, 1);
+  remotePlayers.forEach(recordRemoteTrail);
+  if (trailStamp % 120 === 0) trailEmitters.forEach(dropStaleEmitter);
+  const life = TRAIL_CONFIG.life;
+  for (const q of trailPool) {
+    if (!q.active) continue;
+    q.age += fdt;
+    if (q.age >= life) q.active = false;
   }
 }
 
-function hexToRgb(hex) {
-  const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
-  const n = m ? parseInt(m[1], 16) : 0xffffff;
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-}
-
-// One ribbon as a single filled shape: edges smoothed with quadratic curves through the points,
-// width tapering from TRAIL_WIDTH at the head to 0 at the tail, opacity fading along its length.
-function drawTrailRibbon(points, color, fade, camX, camY) {
-  const n = points.length;
-  if (n < 2 || fade <= 0) return;
-  const head = points[n - 1];
-  const hx = canvas.width / 2 + torusDelta(head.x, camX, WORLD_W), hy = canvas.height / 2 + torusDelta(head.y, camY, WORLD_H);
-  const pts = points.map(p => [hx + (p.x - head.x), hy + (p.y - head.y)]); // unwrapped → continuous on screen
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const [x, y] of pts) { minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y); }
-  if (maxX < -TRAIL_WIDTH || minX > canvas.width + TRAIL_WIDTH || maxY < -TRAIL_WIDTH || minY > canvas.height + TRAIL_WIDTH) return;
-
-  const cum = [0];
-  for (let i = 1; i < n; i++) cum.push(cum[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
-  const total = cum[n - 1];
-  if (total < 1) return;
-  const left = [], right = [];
-  for (let i = 0; i < n; i++) {
-    const a = pts[Math.max(0, i - 1)], b = pts[Math.min(n - 1, i + 1)];
-    let tx = b[0] - a[0], ty = b[1] - a[1];
-    const tl = Math.hypot(tx, ty) || 1;
-    tx /= tl; ty /= tl;
-    const hw = TRAIL_WIDTH / 2 * (cum[i] / total);
-    left.push([pts[i][0] - ty * hw, pts[i][1] + tx * hw]);
-    right.push([pts[i][0] + ty * hw, pts[i][1] - tx * hw]);
-  }
-  const smooth = (edge) => { // quadratic curves through midpoints: no corners or seams
-    for (let i = 1; i < edge.length - 1; i++) {
-      ctx.quadraticCurveTo(edge[i][0], edge[i][1], (edge[i][0] + edge[i + 1][0]) / 2, (edge[i][1] + edge[i + 1][1]) / 2);
-    }
-    ctx.lineTo(edge[edge.length - 1][0], edge[edge.length - 1][1]);
-  };
-  const [r, g, b] = hexToRgb(color);
-  const grad = ctx.createLinearGradient(pts[0][0], pts[0][1], pts[n - 1][0], pts[n - 1][1]);
-  grad.addColorStop(0, `rgba(${r},${g},${b},0)`);
-  grad.addColorStop(1, `rgba(${r},${g},${b},${(TRAIL_ALPHA * fade).toFixed(3)})`);
-  ctx.beginPath();
-  ctx.moveTo(left[0][0], left[0][1]);
-  smooth(left);
-  const rev = right.slice().reverse();
-  ctx.lineTo(rev[0][0], rev[0][1]);
-  smooth(rev);
-  ctx.closePath();
-  ctx.fillStyle = grad;
-  ctx.fill();
-}
-
+// Squares in view units (inside drawWorld's zoom), below ships, each rotated about its center.
+// Drift: velocity falls linearly by driftSlowdown over the life, so the offset is v·t·(1 − k·u/2).
 function drawEngineTrails(camX, camY) {
-  ctx.save();
-  for (const [, rb] of trailRibbons) drawTrailRibbon(rb.points, rb.color, 1, camX, camY);
-  for (const d of detachedTrails) drawTrailRibbon(d.points, d.color, 1 - d.fadeAge / TRAIL_FADE_TIME, camX, camY);
-  ctx.restore();
+  const C = TRAIL_CONFIG, half = C.size / 2, z = viewZoom;
+  for (const q of trailPool) {
+    if (!q.active) continue;
+    const u = q.age / C.life;
+    const d = q.age * (1 - C.driftSlowdown * u / 2);
+    const sx = viewW / 2 + torusDelta(q.x, camX, WORLD_W) + q.vx * d;
+    const sy = viewH / 2 + torusDelta(q.y, camY, WORLD_H) + q.vy * d;
+    if (sx < -C.size || sx > viewW + C.size || sy < -C.size || sy > viewH + C.size) continue;
+    const alpha = C.maxAlpha * Math.pow(1 - u, C.fadePower);
+    if (!(alpha > 0)) continue;
+    const cos = Math.cos(q.angle) * z, sin = Math.sin(q.angle) * z;
+    ctx.setTransform(cos, sin, -sin, cos, sx * z, sy * z); // world zoom × rotation about the center
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = q.color;
+    ctx.fillRect(-half, -half, C.size, C.size);
+  }
+  ctx.setTransform(z, 0, 0, z, 0, 0);
+  ctx.globalAlpha = 1;
 }
 
 // The ship's texture tinted with a color (same technique as drawShip), on its own canvas.
@@ -1862,8 +2487,8 @@ function updateFx(dt) {
 }
 
 function drawFx(camX, camY, layer) {
-  const toScreen = (x, y) => [canvas.width / 2 + torusDelta(x, camX, WORLD_W), canvas.height / 2 + torusDelta(y, camY, WORLD_H)];
-  const visible = (sx, sy, pad = FX_CULL_PAD) => sx > -pad && sx < canvas.width + pad && sy > -pad && sy < canvas.height + pad;
+  const toScreen = (x, y) => [viewW / 2 + torusDelta(x, camX, WORLD_W), viewH / 2 + torusDelta(y, camY, WORLD_H)];
+  const visible = (sx, sy, pad = FX_CULL_PAD) => sx > -pad && sx < viewW + pad && sy > -pad && sy < viewH + pad;
   ctx.save();
   for (const e of fxList) {
     if (e.layer !== layer) continue;
@@ -1926,9 +2551,30 @@ function drawFx(camX, camY, layer) {
       const ty = o ? e.y + torusDelta(o.y, e.y, WORLD_H) * ease : e.y;
       const [sx, sy] = toScreen(tx, ty);
       if (!visible(sx, sy)) continue;
-      const size = Math.max(1, Math.round(e.size * fxShrink(e.age, e.life, PICKUP_POP_STEPS)));
-      if (e.img && e.img._loaded) ctx.drawImage(e.img, Math.round(sx - size / 2), Math.round(sy - size / 2), size, size);
+      const k = fxShrink(e.age, e.life, PICKUP_POP_STEPS);
+      const w = Math.max(1, Math.round(e.w * k)), h = Math.max(1, Math.round(e.h * k));
+      if (e.img && e.img._loaded) {
+        ctx.save();
+        ctx.translate(Math.round(sx), Math.round(sy));
+        ctx.rotate(e.rot || 0);
+        ctx.drawImage(e.img, -w / 2, -h / 2, w, h);
+        ctx.restore();
+      }
 
+    } else if (e.kind === 'blast') {
+      // Stepped ring on the grid: gridSnap squares along a circle growing to blastRadius, fading out.
+      const E = explosionInfo, g = E.gridSnap;
+      const [cx, cy] = toScreen(e.x, e.y);
+      const r = Math.max(g, Math.round(E.blastRadius * t / g) * g);
+      const n = Math.max(8, Math.ceil(2 * Math.PI * r / g));
+      ctx.globalAlpha = Math.max(0, 1 - t);
+      ctx.fillStyle = E.ringColor;
+      for (let i = 0; i < n; i++) {
+        const a = i / n * Math.PI * 2;
+        // Grid relative to the blast center, so the ring reads as blocky squares.
+        ctx.fillRect(cx + Math.round(Math.cos(a) * r / g) * g - g / 2, cy + Math.round(Math.sin(a) * r / g) * g - g / 2, g, g);
+      }
+      ctx.globalAlpha = 1;
     } else if (e.kind === 'ring') {
       const o = fxPlayer(e.playerId);
       if (!o) continue;
@@ -1963,21 +2609,19 @@ function drawGems(camX, camY) {
   for (const g of serverGems) {
     const dx = torusDelta(g.x, camX, WORLD_W);
     const dy = torusDelta(g.y, camY, WORLD_H);
-    const sx = canvas.width  / 2 + dx;
-    const sy = canvas.height / 2 + dy;
+    const sx = viewW  / 2 + dx;
+    const sy = viewH / 2 + dy;
 
-    const margin = 20;
-    if (sx < -margin || sx > canvas.width + margin || sy < -margin || sy > canvas.height + margin) continue;
+    const margin = 40;
+    if (sx < -margin || sx > viewW + margin || sy < -margin || sy > viewH + margin) continue;
 
-    const coinType = g.coinType || 'small';
-    const size = COIN_SIZES[coinType] ?? 12;
-    const half = size / 2;
-    const img = coinImgs[coinType];
-    if (img && img._loaded) {
-      ctx.drawImage(img, sx - half, sy - half, size, size);
+    // Native texture size; fallback dot until the texture is known/loaded.
+    const t = pickupTexture('gold', g.v, g.tex);
+    if (t && t.img._loaded) {
+      drawPickupImage(t, sx, sy, g.rot || 0);
     } else {
       ctx.beginPath();
-      ctx.arc(sx, sy, half, 0, Math.PI * 2);
+      ctx.arc(sx, sy, g.r || 6, 0, Math.PI * 2);
       ctx.fillStyle = '#facc15';
       ctx.fill();
     }
@@ -1988,19 +2632,15 @@ function drawXpDrops(camX, camY) {
   for (const x of serverXpDrops) {
     const dx = torusDelta(x.x, camX, WORLD_W);
     const dy = torusDelta(x.y, camY, WORLD_H);
-    const sx = canvas.width  / 2 + dx;
-    const sy = canvas.height / 2 + dy;
+    const sx = viewW  / 2 + dx;
+    const sy = viewH / 2 + dy;
 
-    const margin = 20;
-    if (sx < -margin || sx > canvas.width + margin || sy < -margin || sy > canvas.height + margin) continue;
+    const margin = 40;
+    if (sx < -margin || sx > viewW + margin || sy < -margin || sy > viewH + margin) continue;
 
-    const type = x.xpType || 'small';
-    const variant = ((x.xpVariant || 1) - 1);
-    const img = xpImgs[type][variant];
-    const size = XP_SIZES[type] ?? 16;
-    const half = size / 2;
-    if (img._loaded) {
-      ctx.drawImage(img, sx - half, sy - half, size, size);
+    const t = pickupTexture('xp', x.v, x.tex);
+    if (t && t.img._loaded) {
+      drawPickupImage(t, sx, sy, x.rot || 0);
     } else {
       ctx.beginPath();
       ctx.arc(sx, sy, 2, 0, Math.PI * 2);
@@ -2014,7 +2654,8 @@ function drawXpDrops(camX, camY) {
 function getBulletAsset(type) {
   const bt = bulletTypes[type] || bulletTypes.basic;
   const img = texImg(bt.texture);
-  return { img, ready: img._loaded, bw: img.naturalWidth * shipTextureScale, bh: img.naturalHeight * shipTextureScale };
+  const k = shipTextureScale * (bt.scale ?? 1); // per-type size multiplier from the server's BULLET_TYPES
+  return { img, ready: img._loaded, bw: img.naturalWidth * k, bh: img.naturalHeight * k };
 }
 
 // Bullet art in a player color, same technique as tintedShipCanvas, cached per texture/color/size.
@@ -2041,8 +2682,8 @@ function drawBullets(camX, camY) {
   for (const b of serverBullets) {
     const dx = torusDelta(b.x, camX, WORLD_W);
     const dy = torusDelta(b.y, camY, WORLD_H);
-    const sx = canvas.width  / 2 + dx;
-    const sy = canvas.height / 2 + dy;
+    const sx = viewW  / 2 + dx;
+    const sy = viewH / 2 + dy;
 
     const { img, ready, bw, bh } = getBulletAsset(b.t);
     if (ready) {
@@ -2067,9 +2708,37 @@ function drawBullets(camX, camY) {
   }
 }
 
+// Same flight curve as the server: distance = range × (1 − (1 − t/life)²), speed falling linearly to 0.
+function shardDistance(sh) {
+  const u = Math.min(1, Math.max(0, sh.age / sh.lf));
+  return sh.rg * (1 - (1 - u) * (1 - u));
+}
+
+// Full opacity until fadeStart of the life, then an ease-in fade to 0 (speeds up toward the end).
+function shardFade(sh) {
+  const u = sh.age / sh.lf, f = shardKindInfo(sh.k).fadeStart;
+  if (u <= f) return 1;
+  const p = Math.min(1, (u - f) / (1 - f));
+  return 1 - p * p;
+}
+
+// Flying particles: solid color silhouettes at their kind's opacity, keeping their launch rotation.
+function drawShards(camX, camY) {
+  for (const sh of serverShards) {
+    const d = shardDistance(sh);
+    const sx = viewW / 2 + torusDelta(wrapX(sh.x0 + sh.dx * d), camX, WORLD_W);
+    const sy = viewH / 2 + torusDelta(wrapY(sh.y0 + sh.dy * d), camY, WORLD_H);
+    if (sx < -40 || sx > viewW + 40 || sy < -40 || sy > viewH + 40) continue;
+    ctx.save();
+    ctx.translate(sx, sy);
+    drawShapeAt(sh.tex, sh.c, sh.rot, shardKindInfo(sh.k).opacity * shardFade(sh));
+    ctx.restore();
+  }
+}
+
 // Debug overlay (?debughit=1): rock polygon (red), hull (yellow), ship circles (cyan), hit points.
 function drawHitDebug(camX, camY) {
-  const toScreen = (x, y) => [canvas.width / 2 + torusDelta(x, camX, WORLD_W), canvas.height / 2 + torusDelta(y, camY, WORLD_H)];
+  const toScreen = (x, y) => [viewW / 2 + torusDelta(x, camX, WORLD_W), viewH / 2 + torusDelta(y, camY, WORLD_H)];
   const strokePoly = (poly, ox, oy) => {
     ctx.beginPath();
     ctx.moveTo(ox + poly[0][0], oy + poly[0][1]);
@@ -2083,7 +2752,7 @@ function drawHitDebug(camX, camY) {
     const shape = rockShape(rock);
     if (!shape) continue;
     const [sx, sy] = toScreen(rock.x, rock.y);
-    if (sx < -shape.boundR || sx > canvas.width + shape.boundR || sy < -shape.boundR || sy > canvas.height + shape.boundR) continue;
+    if (sx < -shape.boundR || sx > viewW + shape.boundR || sy < -shape.boundR || sy > viewH + shape.boundR) continue;
     ctx.strokeStyle = '#ffd400';
     strokePoly(shape.hull, sx, sy);
     ctx.strokeStyle = '#ff2d2d';
@@ -2129,20 +2798,58 @@ function drawRemotePlayers(camX, camY) {
     const ry = p.renderY ?? p.y;
     const dx = torusDelta(rx, camX, WORLD_W);
     const dy = torusDelta(ry, camY, WORLD_H);
-    const sx = canvas.width / 2 + dx;
-    const sy = canvas.height / 2 + dy;
+    const sx = viewW / 2 + dx;
+    const sy = viewH / 2 + dy;
 
     const pr = shipType(p.shipType).r;
     const margin = pr + 60;
-    if (sx < -margin || sx > canvas.width + margin || sy < -margin || sy > canvas.height + margin) continue;
+    if (sx < -margin || sx > viewW + margin || sy < -margin || sy > viewH + margin) continue;
 
     const rs = respawnDrawState(p.id);
     drawShip(sx, sy, p.angle, p.color, p.shipType, hitFlashPlayers.has(p.id), rs.scale, rs.white, rs.alpha);
+    if (p.pirate) { // no nickname or XP; a small HP bar under the ship once damaged
+      if (p.hp < p.maxHp) drawHealthBar(sx, sy + pr + 6, pr, p.hp, p.maxHp);
+      continue;
+    }
     const hpTopY = sy - pr - 12;
     drawNickname(sx, hpTopY, p.name || 'Player');
     drawHealthBar(sx, hpTopY, pr, p.hp, p.maxHp);
     drawXpBar(sx, sy + pr + 6, pr, p.totalXpEarned ?? 0);
   }
+}
+
+// Dev (F9): each pirate's AI state, a line to its target, its aim point and preferred-distance ring.
+function drawPirateDebug(camX, camY) {
+  const toScreen = (x, y) => [viewW / 2 + torusDelta(x, camX, WORLD_W), viewH / 2 + torusDelta(y, camY, WORLD_H)];
+  const colors = { PATROL: '#9ca3af', LOOT: '#facc15', ENGAGE: '#ef4444', RETREAT: '#60a5fa', FLEE: '#a78bfa' };
+  ctx.save();
+  ctx.lineWidth = 1.5;
+  ctx.font = '12px Ticketing';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  for (const [, p] of remotePlayers) {
+    if (!p.pirate || !p.dbg) continue;
+    const [sx, sy] = toScreen(p.renderX ?? p.x, p.renderY ?? p.y);
+    const col = colors[p.dbg.st] || '#ffffff';
+    ctx.fillStyle = col;
+    ctx.fillText(p.dbg.st, sx, sy - 40);
+    if (p.dbg.tg) {
+      const [tx, ty] = toScreen(p.dbg.tg[0], p.dbg.tg[1]);
+      ctx.strokeStyle = col;
+      ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(tx, ty); ctx.stroke();
+      if (p.dbg.st === 'ENGAGE' && p.dbg.pd) {
+        ctx.setLineDash([6, 6]);
+        ctx.beginPath(); ctx.arc(tx, ty, p.dbg.pd, 0, Math.PI * 2); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+    if (p.dbg.aim) {
+      const [ax, ay] = toScreen(p.dbg.aim[0], p.dbg.aim[1]);
+      ctx.strokeStyle = '#ffffff';
+      ctx.beginPath(); ctx.moveTo(ax - 6, ay); ctx.lineTo(ax + 6, ay); ctx.moveTo(ax, ay - 6); ctx.lineTo(ax, ay + 6); ctx.stroke();
+    }
+  }
+  ctx.restore();
 }
 
 // XP rock marker used by every map: rhombus in the rock's accent color, thin white outline,
@@ -2163,11 +2870,36 @@ function drawXpRockMarker(x, y, halfW, color) {
   ctx.stroke();
 }
 
-// Current minimap rect (animates between normal and expanded), for drawing and click consumption.
-function minimapRect() {
+// Minimap rect in the bottom-right corner (animates between normal and expanded), HUD_CORNER_MARGIN from
+// the window's right and bottom edges. The upgrade bar is placed from this rect every frame.
+function minimapCornerRect() {
   const t = easeOutCubic(minimapExpandAnim / MAP_ANIM_TIME);
-  const size = Math.round(MINIMAP_SIZE * (1 + (MINIMAP_EXPANDED_SIZE_MULT - 1) * t));
-  return { x: canvas.width - CORNER_PAD - size, y: canvas.height - CORNER_PAD - size, size, t };
+  const { s } = layout();
+  const size = Math.round(MINIMAP_SIZE * s * (1 + (MINIMAP_EXPANDED_SIZE_MULT - 1) * t));
+  const m = HUD_CORNER_MARGIN * s;
+  return { x: Math.round(canvas.width - m - size), y: Math.round(canvas.height - m - size), size, t };
+}
+
+// Current minimap rect, for drawing and click consumption: the corner rect, morphing into the full map's
+// square as the full map opens (and back as it closes).
+function minimapRect() {
+  const c = minimapCornerRect();
+  const f = worldMapT();
+  const g = f > 0 ? fullMapGeom() : null;
+  if (!g) return c;
+  return {
+    x: Math.round(c.x + (g.mapX - c.x) * f),
+    y: Math.round(c.y + (g.mapY - c.y) * f),
+    size: Math.round(c.size + (g.side - c.size) * f),
+    t: c.t,
+  };
+}
+
+// Death point transitions (was inside drawMinimap; runs every frame even while the minimap is hidden).
+function trackDeathPoint() {
+  if (localPlayer.dead && !prevDead) deathPoint = { x: localPlayer.x, y: localPlayer.y };
+  if (!localPlayer.dead && prevDead) deathPoint = null;
+  prevDead = localPlayer.dead;
 }
 
 function drawMinimap() {
@@ -2177,16 +2909,12 @@ function drawMinimap() {
   const halfWorld = MINIMAP_HALF_WORLD + (MINIMAP_EXPANDED_CHUNKS * CHUNK_SIZE - MINIMAP_HALF_WORLD) * t;
   const scale = half / halfWorld;
   const k = size / MINIMAP_SIZE; // frame-relative sizes (inset, corner radius) scale with the minimap
+  const ks = layout().s;          // dots and text scale with the UI
 
   const camX = localPlayer.x;
   const camY = localPlayer.y;
   const toMini = (x, y) => [mx + half + torusDelta(x, camX, WORLD_W) * scale, my + half + torusDelta(y, camY, WORLD_H) * scale];
   const inside = (sx, sy) => sx >= mx && sx <= mx + size && sy >= my && sy <= my + size;
-
-  // Track death point transitions
-  if (localPlayer.dead && !prevDead) deathPoint = { x: localPlayer.x, y: localPlayer.y };
-  if (!localPlayer.dead && prevDead) deathPoint = null;
-  prevDead = localPlayer.dead;
 
   // Clip contents to rounded frame shape
   ctx.save();
@@ -2250,7 +2978,7 @@ function drawMinimap() {
     ctx.save();
     ctx.globalAlpha = 1 - t;
     for (const [, p] of remotePlayers) {
-      if (p.dead) continue;
+      if (p.dead || p.pirate) continue; // players only
       const [sx, sy] = toMini(p.x, p.y);
       if (!inside(sx, sy)) continue;
       ctx.beginPath();
@@ -2303,14 +3031,14 @@ function drawMinimap() {
 
   // Coordinates + ping above minimap
   ctx.save();
-  ctx.font = "13px Ticketing";
+  ctx.font = `${Math.round(13 * ks)}px Ticketing`;
   ctx.textAlign = "center";
   ctx.textBaseline = "bottom";
   ctx.fillStyle = "rgba(255,255,255,0.7)";
   ctx.fillText(
     `X: ${Math.round(localPlayer.x)}; Y: ${Math.round(localPlayer.y)} | PING: ${ping}`,
     mx + half,
-    my - 8
+    my - 8 * ks
   );
   ctx.restore();
 
@@ -2367,8 +3095,16 @@ function drawUpgradeBar() {
   const gap   = 16;
   const SLOTS = UPGRADE_DEFS_CLIENT.length;
   const totalW = SLOTS * btnW + (SLOTS - 1) * gap;
-  const minimapX = canvas.width - CORNER_PAD - MINIMAP_SIZE;
-  const startX = minimapX - 32 - totalW;
+  // Everything below is in reference px from the bar's top-left (startX = startY = 0), drawn through one
+  // transform; hit boxes and hover use the same origin and scale. The bar sits UPGRADE_BAR_GAP left of
+  // the corner minimap's current edge (recomputed every frame, so the gap holds while the minimap grows or
+  // shrinks), bottom-aligned with it.
+  const { s: us } = layout();
+  const startX = 0, startY = 0;
+  const mini = minimapCornerRect();
+  const bottomY = mini.y + mini.size; // shared bottom line with the minimap
+  const originX = mini.x - UPGRADE_BAR_GAP * us - totalW * us;
+  const hiddenSlide = btnH + HUD_CORNER_MARGIN + 12; // below the window's bottom edge, shadow included
 
   // Auto-show/hide only on transition so manual toggle isn't overridden every frame
   const hasPoints = localPlayer.upgradePoints > 0;
@@ -2376,26 +3112,32 @@ function drawUpgradeBar() {
   if (!hasPoints && _prevUpgradePoints > 0) upgradeBarHidden = true;
   _prevUpgradePoints = localPlayer.upgradePoints;
 
-  const slideTarget = upgradeBarHidden ? btnH + CORNER_PAD : 0;
+  const slideTarget = upgradeBarHidden ? hiddenSlide : 0;
   upgradeBarSlideY += (slideTarget - upgradeBarSlideY) * 0.15;
 
-  const startY = canvas.height - CORNER_PAD - btnH + upgradeBarSlideY;
+  const originY = bottomY - (btnH - upgradeBarSlideY) * us;
 
-  // Label travels with the bar; when fully hidden it sits 8px above screen bottom
+  // Label travels with the bar; when fully hidden it stays on the bar's bottom line.
   ctx.save();
-  ctx.font = '16px Ticketing';
+  ctx.font = `${Math.round(16 * us)}px Ticketing`;
   ctx.textAlign = 'right';
   ctx.textBaseline = 'bottom';
   ctx.fillStyle = 'rgba(255,255,255,0.5)';
   ctx.fillText(
     `press "U" to ${upgradeBarHidden ? 'open' : 'hide'}  |  ${localPlayer.upgradePoints ?? 0} points available`,
-    startX + totalW, Math.min(startY - 8, canvas.height - CORNER_PAD)
+    originX + totalW * us, Math.min(originY - 8 * us, bottomY)
   );
   ctx.restore();
 
   upgradeHitBoxes.length = 0;
 
-  if (upgradeBarSlideY >= btnH + CORNER_PAD - 2) return;
+  if (upgradeBarSlideY >= hiddenSlide - 2) return;
+
+  // Mouse in the bar's reference space (for hover).
+  const localMouseX = (mouseX - originX) / us, localMouseY = (mouseY - originY) / us;
+  ctx.save();
+  ctx.translate(originX, originY);
+  ctx.scale(us, us);
 
   // Dim shadow behind all upgrade buttons
   ctx.fillStyle = 'rgba(0,0,0,0.35)';
@@ -2411,7 +3153,7 @@ function drawUpgradeBar() {
     const maxed     = level >= MAX_UPGRADE_LEVEL;
     const hasPoint  = localPlayer.upgradePoints >= 1;
     const canAfford = !maxed && hasPoint;
-    const hovered   = mouseX >= bx && mouseX <= bx + btnW && mouseY >= by && mouseY <= by + btnH;
+    const hovered   = localMouseX >= bx && localMouseX <= bx + btnW && localMouseY >= by && localMouseY <= by + btnH;
 
     ctx.globalAlpha = (!hasPoint && !maxed) ? 0.35 : 1;
 
@@ -2482,59 +3224,263 @@ function drawUpgradeBar() {
       ctx.fillText('MAX', bx + btnW / 2, by + 101);
     }
 
-    upgradeHitBoxes.push({ x: bx, y: by, w: btnW, h: btnH, id: def.id });
+    upgradeHitBoxes.push({ x: originX + bx * us, y: originY + by * us, w: btnW * us, h: btnH * us, id: def.id });
     ctx.globalAlpha = 1;
   }
 
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'top';
+  ctx.restore();
 }
 
+// Info text top-right of the HUD safe rect (health/level/gold are in the top-left status panel).
+const HUD_INFO_PAD  = 24;  // ref px from the HUD safe rect's edge
+const HUD_INFO_FONT = 14;
 function drawHUD() {
-  const pad = 16;
+  const { s, safe } = layout();
+  const x = safe.right - HUD_INFO_PAD * s, y = safe.y + HUD_INFO_PAD * s, line = (HUD_INFO_FONT + 8) * s;
+  ctx.font = `${Math.round(HUD_INFO_FONT * s)}px Ticketing`;
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.fillText(`X: ${Math.floor(localPlayer.x)}  Y: ${Math.floor(localPlayer.y)}`, x, y);
+  ctx.fillStyle = fps >= 55 ? 'rgba(74,222,128,0.8)' : fps >= 30 ? 'rgba(250,204,21,0.8)' : 'rgba(239,68,68,0.8)';
+  ctx.fillText(`${fps} fps`, x, y + line);
+  ctx.fillStyle = 'rgba(255,255,255,0.6)';
+  ctx.fillText(`players online: ${onlineCount}`, x, y + line * 2);
+}
 
-  ctx.font = "20px Ticketing";
-  ctx.textAlign = "left";
-  ctx.textBaseline = "top";
-  ctx.fillStyle = "#facc15";
-  ctx.fillText(`Gold: ${localPlayer.gemCount}`, pad, pad);
+// --- Top-left status panel: ship card + health / level / gold bars ---
+// The card texture (whole card: frame, ship art, class name) for the local player's class is drawn as-is
+// at `cardScale` of its native size, pre-rendered once per card at that exact size (crisp, no bitmap
+// downscaling), with its top-left at `corner`. Three pointed bars below it, each exactly as wide as the
+// drawn card. Everything pixel-crisp: integer positions, no smoothing.
+const STATUS_PANEL_CONFIG = {
+  corner: 32,               // px from the window's top-left to the card's top-left
+  cardDir: 'interface/shipcards',
+  cardFile: id => `${id}icon1.svg`, // class id → card file in cardDir
+  fallbackClass: 'basic',   // card used when a class's file is missing or fails to load
+  cardScale: 0.75,          // × native card size (bars follow the drawn card's width)
+  barGap: 8,                // px: card → first bar, and between bars
+  barHeight: 16,            // px
+  barTip: 8,                // px pointed tip at each end
+  healthTrack: 'rgba(255,255,255,0.6)', // white track under the health fill
+  health: 'rgba(255,90,90,0.8)',        // #FF5A5A
+  healthTrail: 'rgba(255,184,184,0.8)', // #FFB8B8, between the track and the red fill
+  levelTrack: 'rgba(212,224,154,0.35)', // #D4E09A track under the level fill
+  level: 'rgba(212,224,154,0.8)',       // #D4E09A
+  levelText: '#F6FADF',
+  gold: 'rgba(242,181,58,0.8)',         // #F2B53A, full width, no track
+  goldText: '#FFF0CC',
+  textShadow: { dy: 1, color: 'rgba(0,0,0,0.6)' }, // 1px dark shadow: the light text is low-contrast on the bright fills
+  font: 16,                 // px Ticketing: digits / "l" ≈ 10.5px tall (cap height ≈ 0.66em)
+  capHeight: 10.5,          // px, used to center text vertically
+  fillTime: 0.2,            // s: health and level fills slide to a new value (ease-out)
+  trailHold: 0.3,           // s the health-loss trail holds at the old width
+  trailShrink: 0.4,         // s the trail then takes to shrink to the fill
+};
 
-  ctx.fillStyle = "#4ade80";
-  ctx.fillText(`XP: ${localPlayer.xpCount}`, pad, pad + 28);
+// A value sliding to its target over fillTime with an ease-out (restarted from where it is on change).
+function makeTween(v) { return { from: v, to: v, t: Infinity, value: v }; }
+function tweenTo(tw, target) {
+  if (target === tw.to) return;
+  tw.from = tw.value; tw.to = target; tw.t = 0;
+}
+function tweenSnap(tw, v) { tw.from = tw.to = tw.value = v; tw.t = Infinity; }
+function tweenStep(tw, dt, time) {
+  tw.t += dt;
+  tw.value = tw.t >= time ? tw.to : tw.from + (tw.to - tw.from) * easeOutCubic(tw.t / time);
+  return tw.t >= time;
+}
 
-  const { level: localLevel } = getLevelInfo(localPlayer.totalXpEarned ?? 0);
-  ctx.fillStyle = "#60a5fa";
-  ctx.fillText(`Lv. ${localLevel}`, pad, pad + 56);
+const statusPanel = {
+  ready: false,
+  snap: true,               // next update snaps every bar (first frame, respawn)
+  hp: makeTween(1),
+  trail: { active: false, value: 0, from: 0, t: 0 }, // t: s since the trail started holding
+  lvl: makeTween(0),
+  level: 1,                 // level shown in the text (switches when the fill restarts)
+  pendingLevel: null,       // level-up in progress: { level, progress } after the fill reaches full
+  cardWarned: new Set(),
+  scaledCard: null,         // { src, canvas }: the current card pre-rendered at cardScale
+};
+let hudPanelSnapRequested = false; // set by the network handler when the local player respawns
 
-  ctx.font = "14px Ticketing";
-  ctx.fillStyle = "rgba(255,255,255,0.6)";
-  ctx.fillText(`Players online: ${onlineCount}`, pad, pad + 84);
+function updateHudPanel(dt) {
+  const C = STATUS_PANEL_CONFIG, P = statusPanel;
+  const hp = localPlayer.maxHp > 0 ? Math.max(0, Math.min(1, localPlayer.hp / localPlayer.maxHp)) : 0;
+  const { level, progress } = getLevelInfo(localPlayer.totalXpEarned ?? 0);
+  const lvlTarget = level >= MAX_LEVEL ? 1 : progress;
 
-  ctx.textAlign = "right";
-  ctx.fillStyle = "rgba(255,255,255,0.85)";
-  ctx.fillText(`X: ${Math.floor(localPlayer.x)}  Y: ${Math.floor(localPlayer.y)}`, canvas.width - pad, pad);
-  ctx.font = "14px Ticketing";
-  ctx.fillStyle = fps >= 55 ? "rgba(74,222,128,0.8)" : fps >= 30 ? "rgba(250,204,21,0.8)" : "rgba(239,68,68,0.8)";
-  ctx.fillText(`${fps} fps`, canvas.width - pad, pad + 28);
-  ctx.textAlign = "left";
+  if (P.snap || hudPanelSnapRequested || !P.ready) {
+    tweenSnap(P.hp, hp);
+    tweenSnap(P.lvl, lvlTarget);
+    P.trail.active = false;
+    P.level = level;
+    P.pendingLevel = null;
+    P.snap = false;
+    hudPanelSnapRequested = false;
+    P.ready = myId !== null;
+    return;
+  }
+
+  // Health: slide; on a drop, a trail holds at the old width, then shrinks to the fill.
+  if (hp < P.hp.to) {
+    const T = P.trail;
+    if (T.active) { T.from = T.value; T.t = 0; }  // already trailing: stay where it is, hold again
+    else { T.active = true; T.value = T.from = P.hp.value; T.t = 0; }
+  }
+  tweenTo(P.hp, hp);
+  tweenStep(P.hp, dt, C.fillTime);
+  const T = P.trail;
+  if (T.active) {
+    T.t += dt;
+    const u = (T.t - C.trailHold) / C.trailShrink;
+    T.value = u <= 0 ? T.from : T.from + (P.hp.value - T.from) * easeOutCubic(u);
+    if (u >= 1 || T.value <= P.hp.value) T.active = false;
+  }
+
+  // Level: slide; on level-up, slide to full, then restart from empty toward the new progress.
+  if (level > P.level || P.pendingLevel) {
+    if (level > P.level) P.pendingLevel = { level, progress: lvlTarget };
+    if (P.pendingLevel.level !== level) P.pendingLevel = { level, progress: lvlTarget };
+    P.pendingLevel.progress = lvlTarget;
+    tweenTo(P.lvl, 1);
+    if (tweenStep(P.lvl, dt, C.fillTime)) {
+      P.level = P.pendingLevel.level;
+      tweenSnap(P.lvl, 0);
+      tweenTo(P.lvl, P.pendingLevel.progress);
+      P.pendingLevel = null;
+    }
+  } else {
+    P.level = level;
+    tweenTo(P.lvl, lvlTarget);
+    tweenStep(P.lvl, dt, C.fillTime);
+  }
+}
+
+// Card image for a class; falls back to the fallback class's card (with one warning per missing file).
+function statusCardImg(cls) {
+  const C = STATUS_PANEL_CONFIG;
+  const file = C.cardFile(cls);
+  const img = texImg(`${C.cardDir}/${file}`);
+  if (!img._failed) return img;
+  if (!statusPanel.cardWarned.has(file)) {
+    statusPanel.cardWarned.add(file);
+    console.warn(`[hud] ship card "${C.cardDir}/${file}" is missing or failed to load; using ${C.cardFile(C.fallbackClass)}`);
+  }
+  return texImg(`${C.cardDir}/${C.cardFile(C.fallbackClass)}`);
+}
+
+// The card pre-rendered at cardScale × native size (re-rendered when the card texture changes). Drawing
+// the SVG straight at the target size lets the browser rasterize it crisply at that size.
+function scaledStatusCard(img) {
+  const C = STATUS_PANEL_CONFIG, P = statusPanel;
+  if (P.scaledCard && P.scaledCard.src === img) return P.scaledCard.canvas;
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(img.naturalWidth * C.cardScale));
+  c.height = Math.max(1, Math.round(img.naturalHeight * C.cardScale));
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  P.scaledCard = { src: img, canvas: c };
+  return c;
+}
+
+// Stretched hexagon from x0 to x1 around cy; tips shrink to half the width when narrower than 2 tips.
+function statusBarPath(x0, x1, cy) {
+  const C = STATUS_PANEL_CONFIG, h = C.barHeight / 2;
+  const tip = Math.min(C.barTip, (x1 - x0) / 2);
+  ctx.beginPath();
+  ctx.moveTo(x0, cy);
+  ctx.lineTo(x0 + tip, cy - h);
+  ctx.lineTo(x1 - tip, cy - h);
+  ctx.lineTo(x1, cy);
+  ctx.lineTo(x1 - tip, cy + h);
+  ctx.lineTo(x0 + tip, cy + h);
+  ctx.closePath();
+}
+
+// Fill from x0 over `frac` of the bar (nothing at 0).
+function statusBarFill(x0, w, cy, frac, color) {
+  const fw = w * Math.max(0, Math.min(1, frac));
+  if (!(fw > 0)) return;
+  statusBarPath(x0, x0 + fw, cy);
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+
+// Text centered in the bar at integer pixels (baseline from the cap height).
+function statusBarText(text, x0, w, cy, color) {
+  const C = STATUS_PANEL_CONFIG;
+  ctx.font = `${C.font}px Ticketing`;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = color;
+  const tw = ctx.measureText(text).width;
+  const tx = Math.round(x0 + (w - tw) / 2), ty = Math.round(cy + C.capHeight / 2);
+  if (C.textShadow) {
+    ctx.fillStyle = C.textShadow.color;
+    ctx.fillText(text, tx, ty + C.textShadow.dy);
+    ctx.fillStyle = color;
+  }
+  ctx.fillText(text, tx, ty);
+}
+
+function drawHudPanel() {
+  if (myId === null || !statusPanel.ready) return;
+  const C = STATUS_PANEL_CONFIG, P = statusPanel;
+  const card = statusCardImg(localPlayer.shipType || C.fallbackClass);
+  if (!card._loaded) return; // bars take their width from the card
+  const scaled = scaledStatusCard(card);
+  const x0 = C.corner, w = scaled.width;
+  ctx.save();
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(scaled, x0, C.corner);
+
+  const barY = i => C.corner + scaled.height + C.barGap + i * (C.barHeight + C.barGap);
+  const cyOf = i => barY(i) + C.barHeight / 2;
+
+  // Health: track, loss trail, fill.
+  let cy = cyOf(0);
+  statusBarFill(x0, w, cy, 1, C.healthTrack);
+  if (P.trail.active) statusBarFill(x0, w, cy, P.trail.value, C.healthTrail);
+  statusBarFill(x0, w, cy, P.hp.value, C.health);
+
+  // Level: track, fill, text (XP pickup pulse scales the bar around its center).
+  cy = cyOf(1);
+  const pulse = xpBarPulseScale();
+  ctx.save();
+  if (pulse !== 1) {
+    const cx = x0 + w / 2;
+    ctx.translate(cx, cy); ctx.scale(pulse, pulse); ctx.translate(-cx, -cy);
+  }
+  statusBarFill(x0, w, cy, 1, C.levelTrack);
+  statusBarFill(x0, w, cy, P.lvl.value, C.level);
+  statusBarText(`level ${P.level}`, x0, w, cy, C.levelText);
+  ctx.restore();
+
+  // Gold: full-width bar, amount as a plain integer.
+  cy = cyOf(2);
+  statusBarFill(x0, w, cy, 1, C.gold);
+  statusBarText(String(Math.floor(localPlayer.gemCount || 0)), x0, w, cy, C.goldText);
+  ctx.restore();
 }
 
 function drawDeathScreen() {
+  // Dim the whole window; text centered.
+  const { s } = layout();
   ctx.fillStyle = "rgba(0,0,0,0.6)";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
 
-  ctx.font = "bold 64px Ticketing";
+  ctx.font = `bold ${Math.round(64 * s)}px Ticketing`;
   ctx.fillStyle = "#ef4444";
-  ctx.fillText("YOU DIED", canvas.width / 2, canvas.height / 2 - 44);
+  ctx.fillText("YOU DIED", canvas.width / 2, canvas.height / 2 - 44 * s);
 
-  ctx.font = "24px Ticketing";
+  ctx.font = `${Math.round(24 * s)}px Ticketing`;
   ctx.fillStyle = "rgba(255,255,255,0.8)";
   ctx.fillText(
     `Respawning in ${Math.ceil(Math.max(0, localPlayer.respawnTimer))}s...`,
-    canvas.width / 2, canvas.height / 2 + 20
+    canvas.width / 2, canvas.height / 2 + 20 * s
   );
 
   ctx.textAlign = "left";
@@ -2542,11 +3488,12 @@ function drawDeathScreen() {
 }
 
 function drawConnecting() {
+  const { s } = layout();
   ctx.fillStyle = "rgba(0,0,0,0.85)";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.font = "28px Ticketing";
+  ctx.font = `${Math.round(28 * s)}px Ticketing`;
   ctx.fillStyle = "rgba(255,255,255,0.8)";
   ctx.fillText("Connecting to server...", canvas.width / 2, canvas.height / 2);
   ctx.textAlign = "left";
@@ -2554,16 +3501,19 @@ function drawConnecting() {
 }
 
 // Biome mist: a full-screen wash of the biome's color over the background, below every world object.
-// Alpha is weight × BACKGROUND_TINT_ALPHA, clamped, so it is exactly 0 in the neutral zone.
+// Alpha is weight × the biome's mist alpha, clamped, so it is exactly 0 in the neutral zone.
 function drawBiomeMist() {
   for (const id of ['frost', 'ember']) {
-    const alpha = Math.min(BACKGROUND_TINT_ALPHA, Math.max(0, biomeW[id] * BACKGROUND_TINT_ALPHA));
+    const override = BIOME_MIST_OVERRIDES[id];
+    const maxAlpha = override ? override.alpha : BACKGROUND_TINT_ALPHA;
+    const alpha = Math.min(maxAlpha, Math.max(0, biomeW[id] * maxAlpha));
     if (!(alpha > 0)) continue;
-    const [r, g, b] = BIOMES[id].biomeTint;
+    const [r0, g0, b0] = override ? override.rgb : BIOMES[id].biomeTint;
+    const r = Math.round(r0 * BACKGROUND_BRIGHTNESS), g = Math.round(g0 * BACKGROUND_BRIGHTNESS), b = Math.round(b0 * BACKGROUND_BRIGHTNESS);
     ctx.save();
     ctx.globalAlpha = alpha;
     ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillRect(0, 0, viewW, viewH);
     ctx.restore();
   }
 }
@@ -2573,10 +3523,43 @@ function drawBiomeMist() {
 // error (with the camera position) once, and the rest of the frame (and the HUD) still draws.
 // ctx.save/restore are counted so a layer that throws mid-save can be unwound.
 let ctxSaveDepth = 0;
-{
-  const save = ctx.save.bind(ctx), restore = ctx.restore.bind(ctx);
-  ctx.save = () => { ctxSaveDepth++; save(); };
-  ctx.restore = () => { if (ctxSaveDepth > 0) ctxSaveDepth--; restore(); };
+function countSaves(c) {
+  const save = c.save.bind(c), restore = c.restore.bind(c);
+  c.save = () => { ctxSaveDepth++; save(); };
+  c.restore = () => { if (ctxSaveDepth > 0) ctxSaveDepth--; restore(); };
+}
+countSaves(ctx);
+
+// Fading a group of layers as one: each layer sets its own globalAlpha, so a multiplier would miss some.
+// While 0 < alpha < 1 the group draws into an offscreen layer (ctx points at it), which is then
+// composited once at `alpha`. At 1 it draws directly; at 0 it is skipped.
+const fadeLayer = document.createElement('canvas');
+const fadeCtx = fadeLayer.getContext('2d');
+countSaves(fadeCtx);
+function drawFaded(alpha, fn) {
+  if (!(alpha > 0)) return;
+  if (alpha >= 1) { fn(); return; }
+  if (fadeLayer.width !== canvas.width || fadeLayer.height !== canvas.height) {
+    fadeLayer.width = canvas.width;
+    fadeLayer.height = canvas.height;
+  }
+  const main = ctx, depth = ctxSaveDepth;
+  ctx = fadeCtx;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.clearRect(0, 0, fadeLayer.width, fadeLayer.height);
+  try {
+    fn();
+  } finally {
+    while (ctxSaveDepth > depth) ctx.restore();
+    ctx = main;
+  }
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = alpha;
+  ctx.drawImage(fadeLayer, 0, 0);
+  ctx.restore();
 }
 
 function resetCtxState() {
@@ -2589,6 +3572,7 @@ function resetCtxState() {
 const loggedLayerErrors = new Set();
 function safeLayer(name, fn) {
   const depth = ctxSaveDepth;
+  const transform = ctx.getTransform(); // world layers run zoomed, HUD layers unzoomed
   ctx.save(); // each layer is isolated: its canvas state never reaches the next layer
   try {
     fn();
@@ -2599,7 +3583,7 @@ function safeLayer(name, fn) {
       console.error(`[frame] "${name}" threw at x=${localPlayer.x}, y=${localPlayer.y}; skipping it, rest of the frame continues`, err);
     }
     while (ctxSaveDepth > depth) ctx.restore();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.setTransform(transform);
     ctx.globalAlpha = 1;
     ctx.globalCompositeOperation = 'source-over';
   }
@@ -2624,14 +3608,68 @@ function guardPlayerPosition() {
   if (!Number.isFinite(p.angle)) p.angle = 0;
 }
 
+// --- HUD layout ---
+// No frame: the world fills the window edge to edge. The HUD is drawn in screen space at a fixed pixel
+// size (the 1920×1080 mockup's sizes, never scaled by the world zoom), anchored to the window edges:
+//   s:        reference px → screen px (fixed at HUD_SCALE)
+//   safeRect: the window inset by UI_REF_SAFE_X px on every side; every UI element is placed relative
+//             to it, so resizing the window moves each element with its edge/corner.
+const HUD_SCALE     = 1;
+const UI_REF_SAFE_X = 36; // HUD margin from the window edges (where the old frame's inner edge was)
+let layoutCache = null;
+function layout() {
+  const w = canvas.width, h = canvas.height;
+  if (layoutCache && layoutCache.cw === w && layoutCache.ch === h) return layoutCache;
+  const s = HUD_SCALE;
+  const m = UI_REF_SAFE_X * s;
+  const safe = { x: m, y: m, w: w - 2 * m, h: h - 2 * m };
+  safe.right = safe.x + safe.w; safe.bottom = safe.y + safe.h;
+  layoutCache = { cw: w, ch: h, s, safe };
+  return layoutCache;
+}
+
 function draw() {
   // Fresh canvas state every frame, so nothing drawn last frame can leak into this one.
   resetCtxState();
 
+  // World: everything up to the ships' own overlays, in view units zoomed to the window. Scaling from
+  // the canvas origin keeps the view center (the local player) at the window center.
+  ctx.save();
+  ctx.setTransform(viewZoom, 0, 0, viewZoom, 0, 0);
+  const worldReady = drawWorld();
+  ctx.restore(); // back to screen space: the HUD below is never zoomed
+
+  if (!worldReady) {
+    safeLayer('connecting', drawConnecting);
+    return;
+  }
+
+  // Full map opening: every HUD element fades out together (and back in on close); the minimap
+  // morphs into the full map and cross-fades with it. Only the world and the maps stay visible.
+  const fullT = worldMapT();
+  const hudAlpha = 1 - fullT;
+  trackDeathPoint();
+  drawFaded(hudAlpha, () => {
+    safeLayer('hud', drawHUD);
+    safeLayer('hudPanel', drawHudPanel);
+    safeLayer('upgradeBar', drawUpgradeBar);
+    safeLayer('classMenu', drawClassMenu);
+  });
+  // A fading or hidden HUD takes no clicks or hovers (its hit boxes are rebuilt when it draws again).
+  if (hudAlpha < 1) { upgradeHitBoxes.length = 0; classMenu.rects = []; }
+  drawFaded(1 - fullT, () => safeLayer('minimap', drawMinimap));
+  safeLayer('worldMap', drawWorldMap);
+
+  if (localPlayer.dead) safeLayer('deathScreen', drawDeathScreen);
+}
+
+// Everything that lives in the world, drawn in view units (zoomed). Returns false while connecting.
+function drawWorld() {
   // Biome-tinted background: black → the biome's darkest color by weight. Plain fill, can't throw.
   const [bgR, bgG, bgB] = biomeMixRGB('bgDarkest', [0, 0, 0]);
-  ctx.fillStyle = `rgb(${bgR}, ${bgG}, ${bgB})`;
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const k = BACKGROUND_BRIGHTNESS;
+  ctx.fillStyle = `rgb(${Math.round(bgR * k)}, ${Math.round(bgG * k)}, ${Math.round(bgB * k)})`;
+  ctx.fillRect(0, 0, viewW, viewH);
 
   const camX = localPlayer.x;
   const camY = localPlayer.y;
@@ -2639,45 +3677,39 @@ function draw() {
   safeLayer('stars', () => drawStars(camX, camY));
   safeLayer('shootingStars', () => drawShootingStars(camX, camY));
 
-  if (!connected || myId === null) {
-    safeLayer('connecting', drawConnecting);
-    return;
-  }
+  if (!connected || myId === null) return false;
 
   safeLayer('biomeMist', drawBiomeMist);
+  // Biome particles: above stars/mist, below rocks and all entities.
+  safeLayer('wastelandDust', () => drawBiomeParticles(wastelandDust, camX, camY));
+  safeLayer('emberParticles', () => drawBiomeParticles(emberParticles, camX, camY));
+  safeLayer('frostParticles', () => drawBiomeParticles(frostParticles, camX, camY));
   safeLayer('rocks', () => drawRocks(camX, camY));
   safeLayer('xpParticles', () => drawXpParticles(camX, camY));
+  safeLayer('goldParticles', () => drawGoldParticles(camX, camY));
   safeLayer('shatter', () => drawShatterEffects(camX, camY));
   safeLayer('gems', () => drawGems(camX, camY));
   safeLayer('xpDrops', () => drawXpDrops(camX, camY));
   safeLayer('engineTrails', () => drawEngineTrails(camX, camY)); // engine ribbons: below ships
   safeLayer('fxWorld', () => drawFx(camX, camY, 'world')); // sparks, pickup pops, level rings: above rocks and loot, below ships
   safeLayer('bullets', () => drawBullets(camX, camY));
+  safeLayer('shards', () => drawShards(camX, camY));
   safeLayer('remotePlayers', () => drawRemotePlayers(camX, camY));
 
   if (!localPlayer.dead) safeLayer('localShip', () => {
-    const cx = canvas.width / 2, cy = canvas.height / 2;
+    const cx = viewW / 2, cy = viewH / 2;
     const pr = shipType(localPlayer.shipType).r;
     const rs = respawnDrawState(myId);
     drawShip(cx, cy, localPlayer.angle, localPlayer.color, localPlayer.shipType, hitFlashPlayers.has(myId), rs.scale, rs.white, rs.alpha);
-    const hpTopY = cy - pr - 12;
-    drawNickname(cx, hpTopY, localPlayer.nickname || 'Player');
-    drawHealthBar(cx, hpTopY, pr, localPlayer.hp, localPlayer.maxHp);
-    drawXpBar(cx, cy + pr + 6, pr, localPlayer.totalXpEarned, xpBarPulseScale());
+    // Own health/XP live in the top-left panel now; the name stays over the ship.
+    drawNickname(cx, cy - pr - 12, localPlayer.nickname || 'Player');
   });
 
   safeLayer('fxTop', () => drawFx(camX, camY, 'top')); // muzzle flashes and level text: above ships, below the HUD
 
   if (DEBUG_HIT) safeLayer('hitDebug', () => drawHitDebug(camX, camY));
-
-  safeLayer('hud', drawHUD);
-  safeLayer('upgradeBar', drawUpgradeBar);
-  safeLayer('minimap', drawMinimap);
-
-  safeLayer('classMenu', drawClassMenu);
-  safeLayer('worldMap', drawWorldMap);
-
-  if (localPlayer.dead) safeLayer('deathScreen', drawDeathScreen);
+  if (import.meta.env.DEV && pirateDebug) safeLayer('pirateDebug', () => drawPirateDebug(camX, camY));
+  return true;
 }
 
 // Parallax star layers, tinted toward the biome's star color by weight.
@@ -2687,13 +3719,15 @@ function drawStars(camX, camY) {
   for (const layer of starLayers) {
     const ox = ((camX * layer.parallax) % PARALLAX_TILE + PARALLAX_TILE) % PARALLAX_TILE;
     const oy = ((camY * layer.parallax) % PARALLAX_TILE + PARALLAX_TILE) % PARALLAX_TILE;
+    // Enough tile copies to cover the view, which can be wider/taller than one tile when zoomed out.
+    const txMax = Math.ceil(viewW / PARALLAX_TILE), tyMax = Math.ceil(viewH / PARALLAX_TILE);
     for (const s of layer.stars) {
       const a = (s.alpha * (0.7 + 0.3 * Math.sin(s.phase))).toFixed(2);
-      for (let tx = -1; tx <= 1; tx++) {
-        for (let ty = -1; ty <= 1; ty++) {
+      for (let tx = -1; tx <= txMax; tx++) {
+        for (let ty = -1; ty <= tyMax; ty++) {
           const sx = s.x - ox + tx * PARALLAX_TILE;
           const sy = s.y - oy + ty * PARALLAX_TILE;
-          if (sx < -s.r || sx > canvas.width + s.r || sy < -s.r || sy > canvas.height + s.r) continue;
+          if (sx < -s.r || sx > viewW + s.r || sy < -s.r || sy > viewH + s.r) continue;
           ctx.beginPath();
           ctx.arc(sx, sy, s.r, 0, Math.PI * 2);
           ctx.fillStyle = `rgba(${Math.round(starR)},${Math.round(starG)},${Math.round(starB)},${a})`;
@@ -2709,8 +3743,6 @@ function drawStars(camX, camY) {
 // Layout measured from public/textures/interface/classes/demoscreenupgrade.svg at 1920×1080 and
 // scaled with the viewport. Values are reference pixels at that size. Cards are click-only.
 
-const CLASS_MENU_REF_W       = 1920;
-const CLASS_MENU_REF_H       = 1080;
 const CLASS_CARD_SCALE       = 1 / 1.5; // cards (art, border, radius, name, gap) vs the mockup's 256×224
 const CLASS_CARD_W           = 256 * CLASS_CARD_SCALE; // outer size incl. the border (≈171×149)
 const CLASS_CARD_H           = 224 * CLASS_CARD_SCALE;
@@ -2846,10 +3878,13 @@ function drawClassMenu() {
   classMenu.rects = [];
   if (classMenu.clock === 0 || !classMenu.options.length) return;
 
-  const s  = Math.min(canvas.width / CLASS_MENU_REF_W, canvas.height / CLASS_MENU_REF_H);
+  const s  = layout().s;
   const px = v => Math.round(v * s);
   const n  = classMenu.options.length;
   const menuW = n * CLASS_CARD_W + (n - 1) * CLASS_CARD_GAP;
+  // Top middle of the window: centered horizontally, the menu's top (y = 0 of the mockup values)
+  // CLASS_MENU_TOP below the window top.
+  const oy = Math.round(CLASS_MENU_TOP * s);
   const x0 = Math.round(canvas.width / 2 - (menuW * s) / 2);
   const level = classMenu.options[0].level;
   const color = localPlayer.color || '#ffffff';
@@ -2865,8 +3900,8 @@ function drawClassMenu() {
     ctx.fillStyle = '#ffffff';
     ctx.textAlign = 'left';
     ctx.font = `${px(CLASS_FONT_PX)}px Ticketing`;
-    ctx.fillText(`you've reached level ${level}!`, x0, Math.round(ty) + px(CLASS_TITLE_BASELINES[0]));
-    ctx.fillText('choose an upgrade:', x0, Math.round(ty) + px(CLASS_TITLE_BASELINES[1]));
+    ctx.fillText(`you've reached level ${level}!`, x0, oy + Math.round(ty) + px(CLASS_TITLE_BASELINES[0]));
+    ctx.fillText('choose an upgrade:', x0, oy + Math.round(ty) + px(CLASS_TITLE_BASELINES[1]));
   }
 
   let hoverHint = null;
@@ -2875,7 +3910,7 @@ function drawClassMenu() {
     if (cp <= 0) return;
     const w = px(CLASS_CARD_W), h = px(CLASS_CARD_H);
     const x = x0 + px(i * (CLASS_CARD_W + CLASS_CARD_GAP));
-    const y = px(CLASS_CARD_TOP) - Math.round(px(CLASS_APPEAR_SLIDE) * (1 - cp));
+    const y = oy + px(CLASS_CARD_TOP) - Math.round(px(CLASS_APPEAR_SLIDE) * (1 - cp));
     classMenu.rects.push({ id: opt.id, x, y, w, h });
 
     const hv = easeOutCubic(classMenu.hover[opt.id] || 0);
@@ -2936,7 +3971,7 @@ function drawClassMenu() {
     ctx.fillStyle = '#ffffff';
     ctx.textAlign = 'left';
     ctx.font = `${px(CLASS_HINT_FONT_PX)}px Ticketing`;
-    ctx.fillText(hoverHint, x0, px(CLASS_CARD_TOP + CLASS_CARD_H + CLASS_HINT_GAP));
+    ctx.fillText(hoverHint, x0, oy + px(CLASS_CARD_TOP + CLASS_CARD_H + CLASS_HINT_GAP));
   }
   ctx.restore();
 }
@@ -2946,7 +3981,7 @@ function drawClassMenu() {
 // your ship and death point. Styled like the class-upgrade menu. Values are reference pixels at
 // 1920×1080, scaled with the viewport.
 
-const MAP_MARGIN          = 48;    // panel distance from the screen edges
+const MAP_MARGIN          = 24;    // panel distance from the HUD safe rect's edge
 const MAP_PAD             = 20;    // map square inset from the panel border
 const MAP_HEADER          = 44;    // header row (title + current chunk) above the map square
 const MAP_BORDER          = 4;
@@ -2963,8 +3998,7 @@ const MAP_ROCK_MIN_R      = 1.5;   // px; rock dots are sized by rock radius at 
 const MAP_SHIP_SIZE       = 12;    // arrow length
 const MAP_SHIP_BLINK_HZ   = 1.2;   // gentle pulse between MAP_SHIP_BLINK_MIN and full opacity
 const MAP_SHIP_BLINK_MIN  = 0.55;
-const MAP_ANIM_TIME       = 0.25;  // s open/close (fade + slide)
-const MAP_SLIDE           = 24;    // px
+const MAP_ANIM_TIME       = 0.25;  // s: normal ↔ bigger minimap, and minimap ↔ full map (morph + fade)
 
 const worldMap = {
   open: false,
@@ -2993,27 +4027,47 @@ function mapHit(x, y) {
 
 function updateWorldMap(dt) {
   worldMap.anim = worldMap.open ? Math.min(MAP_ANIM_TIME, worldMap.anim + dt) : Math.max(0, worldMap.anim - dt);
-  minimapExpandAnim = mapMode === 1 ? Math.min(MAP_ANIM_TIME, minimapExpandAnim + dt) : Math.max(0, minimapExpandAnim - dt);
+  // While the full map is open the corner minimap keeps its size, so closing morphs back from the state
+  // it was opened from (and then shrinks to normal together with the close).
+  if (mapMode !== 2) {
+    minimapExpandAnim = mapMode === 1 ? Math.min(MAP_ANIM_TIME, minimapExpandAnim + dt) : Math.max(0, minimapExpandAnim - dt);
+  }
+}
+
+// Full-map open progress, eased: 0 closed … 1 open.
+function worldMapT() {
+  return easeOutCubic(worldMap.anim / MAP_ANIM_TIME);
+}
+
+// The full map's square map area (fitted inside the HUD safe rect, panel around it), or null if too small.
+function fullMapGeom() {
+  const { s, safe } = layout();
+  const px = v => Math.round(v * s);
+  const side = Math.floor(Math.min(
+    safe.w - 2 * px(MAP_MARGIN) - 2 * px(MAP_PAD),
+    safe.h - 2 * px(MAP_MARGIN) - px(MAP_HEADER) - px(MAP_PAD)));
+  if (side < 64) return null;
+  const panelW = side + 2 * px(MAP_PAD), panelH = side + px(MAP_HEADER) + px(MAP_PAD);
+  const panelX = Math.round(safe.x + (safe.w - panelW) / 2);
+  const panelY = Math.round(safe.y + (safe.h - panelH) / 2);
+  return { side, mapX: panelX + px(MAP_PAD), mapY: panelY + px(MAP_HEADER) };
 }
 
 function drawWorldMap() {
   worldMap.panel = null;
   if (worldMap.anim === 0 || myId === null) return;
 
-  const s = Math.min(canvas.width / 1920, canvas.height / 1080);
+  const { s } = layout();
   const px = v => Math.round(v * s);
-  const t = easeOutCubic(worldMap.anim / MAP_ANIM_TIME);
+  const t = worldMapT();
 
-  // Square map area fitted to the screen, panel around it.
-  const side = Math.floor(Math.min(
-    canvas.width  - 2 * px(MAP_MARGIN) - 2 * px(MAP_PAD),
-    canvas.height - 2 * px(MAP_MARGIN) - px(MAP_HEADER) - px(MAP_PAD)));
-  if (side < 64) return;
+  // The map area is the minimap's rect morphing between the corner and the full square (fullMapGeom),
+  // so the full map grows out of the minimap; the panel is built around it.
+  if (!fullMapGeom()) return;
+  const { x: mapX, y: mapY, size: side } = minimapRect();
   const cell = side / CHUNKS_PER_AXIS;
+  const panelX = mapX - px(MAP_PAD), panelY = mapY - px(MAP_HEADER);
   const panelW = side + 2 * px(MAP_PAD), panelH = side + px(MAP_HEADER) + px(MAP_PAD);
-  const panelX = Math.round((canvas.width - panelW) / 2);
-  const panelY = Math.round((canvas.height - panelH) / 2 - px(MAP_SLIDE) * (1 - t));
-  const mapX = panelX + px(MAP_PAD), mapY = panelY + px(MAP_HEADER);
   worldMap.panel = { x: panelX, y: panelY, w: panelW, h: panelH };
 
   // World → map pixels (world is centered on the origin; chunk (cx, cy) spans cell index cx - CHUNK_MIN).
@@ -3176,12 +4230,18 @@ function loop(now) {
   requestAnimationFrame(loop); // scheduled first: nothing below can stop the game loop
   safeLayer('update', () => update(dt));
   guardPlayerPosition();
+  safeLayer('updateView', () => updateViewFactor(dt));
   safeLayer('updateBiomeWeights', () => updateBiomeWeights(dt));
+  safeLayer('updateWastelandDust', () => updateBiomeParticles(wastelandDust, dt));
+  safeLayer('updateEmberParticles', () => updateBiomeParticles(emberParticles, dt));
+  safeLayer('updateFrostParticles', () => updateBiomeParticles(frostParticles, dt));
   safeLayer('updateShatter', () => updateShatterEffects(dt));
   safeLayer('updateXpParticles', () => updateXpParticles(dt));
+  safeLayer('updateGoldParticles', () => updateGoldParticles(dt));
   safeLayer('updateFx', () => updateFx(dt));
   safeLayer('updateClassMenu', () => updateClassMenu(dt));
   safeLayer('updateWorldMap', () => updateWorldMap(dt));
+  safeLayer('updateHudPanel', () => updateHudPanel(dt));
   draw();
 }
 requestAnimationFrame(loop);
